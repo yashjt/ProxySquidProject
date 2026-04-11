@@ -1,0 +1,18 @@
+version: "3.8"
+ 
+services:
+  squid:
+    build: .
+    container_name: squid-proxy
+    ports:
+      - "3128:3128"         # Maps host port 3128 to container port 3128
+    volumes:
+      - ./squid.conf:/etc/squid/squid.conf:ro   # Live config (read-only mount)
+      - squid-logs:/var/log/squid               # Persist logs
+      - squid-cache:/var/spool/squid            # Persist cache
+    restart: unless-stopped
+ 
+volumes:
+  squid-logs:
+  squid-cache:
+ 
