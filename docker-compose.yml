@@ -1,18 +1,61 @@
-version: "3.8"
- 
 services:
+
+  postgres:
+    image: postgres:16
+    container_name: squid-db
+    environment:
+      POSTGRES_DB: squid_categories
+      POSTGRES_USER: squid
+      POSTGRES_PASSWORD: squidpass
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U squid -d squid_categories"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  db-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.init
+    container_name: squid-db-init
+    environment:
+      DB_HOST: postgres
+      DB_NAME: squid_categories
+      DB_USER: squid
+      DB_PASSWORD: squidpass
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   squid:
     build: .
     container_name: squid-proxy
     ports:
-      - "3128:3128"         # Maps host port 3128 to container port 3128
+      - "3128:3128"
+      - "8080:8080"
     volumes:
-      - ./squid.conf:/etc/squid/squid.conf:ro   # Live config (read-only mount)
-      - squid-logs:/var/log/squid               # Persist logs
-      - squid-cache:/var/spool/squid            # Persist cache
+      - ./squid.conf:/etc/squid/squid.conf:ro
+      - ./squid_helper.py:/usr/local/bin/squid_helper.py
+      - ./proxy.pac:/var/www/pac/proxy.pac:ro
+      - squid-logs:/var/log/squid
+      - squid-cache:/var/spool/squid
+    environment:
+      DB_HOST: postgres
+      DB_NAME: squid_categories
+      DB_USER: squid
+      DB_PASSWORD: squidpass
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
- 
+
 volumes:
+  pgdata:
   squid-logs:
   squid-cache:
- 
