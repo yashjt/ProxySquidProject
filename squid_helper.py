@@ -1,19 +1,28 @@
- 
+#!/usr/bin/env python3
+
 import sys
 import os
 import logging
 import psycopg2
 import psycopg2.extras
 from datetime import datetime
- 
+
 # ── Logging (to file, not stdout — stdout is reserved for Squid responses) ──
+log_file = '/var/log/squid/categorizer.log'
+handlers = []
+
+try:
+    handlers.append(logging.FileHandler(log_file))
+except Exception:
+    handlers.append(logging.StreamHandler(sys.stderr))
+
 logging.basicConfig(
-    filename='/var/log/squid/categorizer.log',
     level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s'
+    format='%(asctime)s %(levelname)s %(message)s',
+    handlers=handlers
 )
 log = logging.getLogger(__name__)
- 
+
 # ── Database config from environment variables ──
 DB_CONFIG = {
     'host':     os.environ.get('DB_HOST', 'postgres'),
@@ -22,34 +31,34 @@ DB_CONFIG = {
     'password': os.environ.get('DB_PASSWORD', 'squidpass'),
     'connect_timeout': 5,
 }
- 
-# ── In-memory cache to reduce DB hits (domain → 'ALLOW'/'DENY') ──
+
+# ── In-memory cache to reduce DB hits (domain → squid response) ──
+# IMPORTANT: cache stores the Squid protocol value:
+#   'OK'  = ACL matched = Squid will BLOCK  (domain is in a blocked category)
+#   'ERR' = ACL not matched = Squid will ALLOW (domain is safe)
 _cache: dict[str, str] = {}
 CACHE_MAX = 10000
- 
- 
+
+
 def get_db_connection():
-    """Create a new PostgreSQL connection."""
     return psycopg2.connect(**DB_CONFIG)
- 
- 
+
+
 def get_blocked_categories(conn) -> set:
-    """Fetch enabled blocked categories from DB."""
     with conn.cursor() as cur:
         cur.execute(
             "SELECT category FROM blocked_categories WHERE enabled = TRUE"
         )
         return {row[0] for row in cur.fetchall()}
- 
- 
+
+
 def lookup_domain(conn, domain: str, blocked_cats: set) -> tuple[str, str]:
     """
-    Look up domain in url_categories table.
     Tries exact match first, then strips subdomains one level at a time.
-    Returns (action, category): action is 'ALLOW' or 'DENY'.
+    e.g. mail.google.com → google.com
+    Returns (action, category): action is 'DENY' or 'ALLOW'.
     """
     parts = domain.split('.')
-    # Try progressively shorter versions: sub.example.com → example.com
     for i in range(len(parts) - 1):
         candidate = '.'.join(parts[i:])
         with conn.cursor() as cur:
@@ -62,12 +71,11 @@ def lookup_domain(conn, domain: str, blocked_cats: set) -> tuple[str, str]:
                 category = row[0]
                 action = 'DENY' if category in blocked_cats else 'ALLOW'
                 return action, category
- 
+
     return 'ALLOW', 'uncategorized'
- 
- 
+
+
 def log_uncategorized(conn, domain: str):
-    """Track domains not in the DB so you can review and categorize them later."""
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -82,10 +90,9 @@ def log_uncategorized(conn, domain: str):
     except Exception as e:
         conn.rollback()
         log.warning(f"Could not log uncategorized domain {domain}: {e}")
- 
- 
+
+
 def log_request(conn, domain: str, category: str, action: str):
-    """Append to request_log for auditing."""
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -96,13 +103,23 @@ def log_request(conn, domain: str, category: str, action: str):
     except Exception as e:
         conn.rollback()
         log.warning(f"Could not write request log for {domain}: {e}")
- 
- 
+
+
+def squid_response(action: str) -> str:
+    """
+    Convert internal action to Squid external ACL protocol response.
+    Squid's blocked_url ACL fires on OK, so:
+      DENY  → OK  (ACL matches → Squid blocks)
+      ALLOW → ERR (ACL doesn't match → Squid allows)
+    """
+    return 'OK' if action == 'DENY' else 'ERR'
+
+
 def main():
     conn = None
     blocked_cats = set()
-    blocked_cats_ts = None   # timestamp of last fetch
- 
+    blocked_cats_ts = None
+
     try:
         conn = get_db_connection()
         blocked_cats = get_blocked_categories(conn)
@@ -110,63 +127,62 @@ def main():
         log.info(f"Connected to DB. Blocked categories: {blocked_cats}")
     except Exception as e:
         log.error(f"DB connection failed: {e}. Defaulting to ALLOW for all.")
- 
+
     for raw_line in sys.stdin:
         line = raw_line.strip()
         if not line:
             continue
- 
-        # Strip port number if present (e.g. "facebook.com:443" → "facebook.com")
-        domain = line.lower().split(':')[0].strip()
- 
-        # Re-fetch blocked categories every 5 minutes so DB changes apply live
+
+        # Take first word only, strip port (e.g. "facebook.com:443" → "facebook.com")
+        domain = line.lower().split()[0].split(':')[0].strip()
+
+        # Refresh blocked categories every 5 minutes
         if conn and blocked_cats_ts:
-            delta = (datetime.now() - blocked_cats_ts).total_seconds()
-            if delta > 300:
+            if (datetime.now() - blocked_cats_ts).total_seconds() > 300:
                 try:
                     blocked_cats = get_blocked_categories(conn)
                     blocked_cats_ts = datetime.now()
                 except Exception as e:
                     log.warning(f"Could not refresh blocked categories: {e}")
- 
+
         # Check in-memory cache first
         if domain in _cache:
             print(_cache[domain], flush=True)
             continue
- 
-        # Default to ALLOW if DB is unavailable
+
+        # DB unavailable — fail open (allow everything)
         if not conn:
-            print('OK', flush=True)
+            print('ERR', flush=True)
             continue
- 
+
         try:
-            # Reconnect if connection dropped
             if conn.closed:
                 conn = get_db_connection()
- 
+
             action, category = lookup_domain(conn, domain, blocked_cats)
- 
+
             if category == 'uncategorized':
                 log_uncategorized(conn, domain)
- 
+
             log_request(conn, domain, category, action)
             log.info(f"{domain} → {category} → {action}")
- 
-            # Cache the result
+
+            response = squid_response(action)
+
+            # Cache uses the same squid_response value
             if len(_cache) < CACHE_MAX:
-                _cache[domain] = 'ERR' if action == 'DENY' else 'OK'
- 
-            print('ERR' if action == 'DENY' else 'OK', flush=True)
- 
+                _cache[domain] = response
+
+            print(response, flush=True)
+
         except Exception as e:
             log.error(f"Error processing domain {domain}: {e}")
             try:
                 conn = get_db_connection()
             except Exception:
                 conn = None
-            # Fail open — allow on error
-            print('OK', flush=True)
- 
- 
+            print('ERR', flush=True)  # fail open on error
+
+
 if __name__ == '__main__':
     main()
