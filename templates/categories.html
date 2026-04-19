@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Categories — ProxyGuard{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div class="page-title">Category Management</div>
+    <div class="page-sub">Toggle blocked categories — changes apply within 5 minutes</div>
+</div>
+
+<div class="card">
+    <table>
+        <thead>
+            <tr>
+                <th>Category</th>
+                <th>Description</th>
+                <th>Domains in DB</th>
+                <th>Block</th>
+            </tr>
+        </thead>
+        <tbody id="cat-tbody">
+            <tr><td colspan="4" style="color:var(--text-dim);text-align:center;padding:30px">Loading...</td></tr>
+        </tbody>
+    </table>
+</div>
+
+<script>
+async function load() {
+    const r = await fetch('/api/categories');
+    const rows = await r.json();
+    const tbody = document.getElementById('cat-tbody');
+    tbody.innerHTML = rows.map(c => `
+        <tr>
+            <td><span class="badge badge-cat">${c.category}</span></td>
+            <td style="color:var(--text-dim)">${c.description || '—'}</td>
+            <td style="color:var(--text)">${c.domain_count.toLocaleString()}</td>
+            <td>
+                <label class="toggle">
+                    <input type="checkbox" ${c.enabled ? 'checked' : ''}
+                           onchange="toggle('${c.category}', this)">
+                    <span class="toggle-slider"></span>
+                </label>
+            </td>
+        </tr>
+    `).join('');
+}
+
+async function toggle(category, checkbox) {
+    const r = await fetch(`/api/categories/${category}/toggle`, { method: 'POST' });
+    const d = await r.json();
+    checkbox.checked = d.enabled;
+}
+
+load();
+</script>
+{% endblock %}

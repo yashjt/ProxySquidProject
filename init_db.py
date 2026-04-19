@@ -21,18 +21,18 @@ DB_CONFIG = {
     'user':     os.environ.get('DB_USER', 'squid'),
     'password': os.environ.get('DB_PASSWORD', 'squidpass'),
 }
-
+# categories imported from ut1 database 
 CATEGORIES_TO_IMPORT = [
     'gambling', 'adult', 'malware', 'phishing', 'warez',
     'dating', 'drugs', 'hacking', 'social_networks', 'news',
     'shopping', 'games', 'finance', 'education', 'health', 'government',
 ]
 
-UT1_BASE_URL = "https://dsi.ut-capitole.fr/blacklists/download"  # Bug 3 fix
+UT1_BASE_URL = "https://dsi.ut-capitole.fr/blacklists/download"  # url for ut1 
 
-BATCH_SIZE = 1000
+BATCH_SIZE = 1000 # Number of rows to insert this for performance optimization 
 
-
+# this is to wait for connection before importing the database 
 def wait_for_db(max_retries=20, delay=3):
     for attempt in range(max_retries):
         try:
@@ -46,19 +46,18 @@ def wait_for_db(max_retries=20, delay=3):
     log.error("Database never became ready")
     sys.exit(1)
 
-
+# Return True if any domain in the category exist 
 def already_imported(conn, category: str) -> bool:
     with conn.cursor() as cur:
-        cur.execute(                                          # Bug 1 fix
+        cur.execute(                                         
             "SELECT COUNT(*) FROM url_categories WHERE category = %s",
             (category,)
         )
         return cur.fetchone()[0] > 0
 
-
 def bulk_insert(conn, rows: list[tuple]):
     with conn.cursor() as cur:
-        psycopg2.extras.execute_values(                       # Bug 2 fix
+        psycopg2.extras.execute_values(                      
             cur,
             """
             INSERT INTO url_categories (domain, category)
@@ -71,7 +70,7 @@ def bulk_insert(conn, rows: list[tuple]):
         )
     conn.commit()
 
-
+# Constructs URL like https://dsi.ut-capitole.fr/blacklists/download/gambling.tar.gz
 def download_category(category: str) -> list[str]:
     url = f"{UT1_BASE_URL}/{category}.tar.gz"
     log.info(f"Downloading {category} from {url}")
@@ -88,7 +87,7 @@ def download_category(category: str) -> list[str]:
 
     domains = []
     try:
-        with tarfile.open(fileobj=BytesIO(resp.content), mode='r:gz') as tar:
+        with tarfile.open(fileobj=BytesIO(resp.content), mode='r:gz') as tar:  # r:gz reading for gzip file 
             for member in tar.getmembers():
                 if member.name.endswith('/domains') or member.name == 'domains':
                     f = tar.extractfile(member)
@@ -113,6 +112,7 @@ def main():
     wait_for_db()
     conn = psycopg2.connect(**DB_CONFIG)
     total_imported = 0
+
 
     for category in CATEGORIES_TO_IMPORT:
         if already_imported(conn, category):

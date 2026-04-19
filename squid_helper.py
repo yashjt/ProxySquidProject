@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 
-import sys
-import os
-import logging
-import psycopg2
+
+import sys  # for  reading stdin and writing stdin out 
+import os # for enviroment variable 
+import logging 
+import psycopg2 # Postgracesql driver 
 import psycopg2.extras
-from datetime import datetime
+from datetime import datetime 
 
-# ── Logging (to file, not stdout — stdout is reserved for Squid responses) ──
+# This is where we store the logs 
 log_file = '/var/log/squid/categorizer.log'
-handlers = []
 
+
+# Attemps to create file log  if it can't it falls back to stderr
+handlers = []
 try:
     handlers.append(logging.FileHandler(log_file))
 except Exception:
     handlers.append(logging.StreamHandler(sys.stderr))
 
+
+# Configure log formate 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s %(message)s',
@@ -23,7 +28,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Database config from environment variables ──
+# Database configuration from enviroment variable 
 DB_CONFIG = {
     'host':     os.environ.get('DB_HOST', 'postgres'),
     'dbname':   os.environ.get('DB_NAME', 'squid_categories'),
@@ -32,18 +37,15 @@ DB_CONFIG = {
     'connect_timeout': 5,
 }
 
-# ── In-memory cache to reduce DB hits (domain → squid response) ──
-# IMPORTANT: cache stores the Squid protocol value:
-#   'OK'  = ACL matched = Squid will BLOCK  (domain is in a blocked category)
-#   'ERR' = ACL not matched = Squid will ALLOW (domain is safe)
+# In-memory cache to avoid repeated DB queries for same domain. OK = block, ERR = allow
 _cache: dict[str, str] = {}
 CACHE_MAX = 10000
 
-
+# return postgreas connection 
 def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
 
-
+# return categeory that are blocked 
 def get_blocked_categories(conn) -> set:
     with conn.cursor() as cur:
         cur.execute(
@@ -74,7 +76,7 @@ def lookup_domain(conn, domain: str, blocked_cats: set) -> tuple[str, str]:
 
     return 'ALLOW', 'uncategorized'
 
-
+# logs domain that is not found in database 
 def log_uncategorized(conn, domain: str):
     try:
         with conn.cursor() as cur:
@@ -91,7 +93,7 @@ def log_uncategorized(conn, domain: str):
         conn.rollback()
         log.warning(f"Could not log uncategorized domain {domain}: {e}")
 
-
+# Simple insert into request_log table for audit trail
 def log_request(conn, domain: str, category: str, action: str):
     try:
         with conn.cursor() as cur:
@@ -150,7 +152,7 @@ def main():
             print(_cache[domain], flush=True)
             continue
 
-        # DB unavailable — fail open (allow everything)
+        # DB unavailable (allow everything)
         if not conn:
             print('ERR', flush=True)
             continue

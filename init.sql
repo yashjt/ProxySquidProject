@@ -1,6 +1,4 @@
--- ============================================================
---  Squid URL Categorization Database Schema
--- ============================================================
+
 
 -- Main table: stores domain → category mappings from UT1 blacklist
 CREATE TABLE IF NOT EXISTS url_categories (

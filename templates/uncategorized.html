@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Uncategorized — ProxyGuard{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div class="page-title">Uncategorized Domains</div>
+    <div class="page-sub">Domains seen by Squid not in the UT1 database — review and categorize</div>
+</div>
+
+<div class="card">
+    <table>
+        <thead>
+            <tr>
+                <th>Domain</th>
+                <th>Hits</th>
+                <th>First Seen</th>
+                <th>Last Seen</th>
+                <th>Category</th>
+            </tr>
+        </thead>
+        <tbody id="uncat-tbody">
+            <tr><td colspan="5" style="color:var(--text-dim);text-align:center;padding:30px">Loading...</td></tr>
+        </tbody>
+    </table>
+</div>
+
+<script>
+async function load() {
+    const r = await fetch('/api/uncategorized');
+    const rows = await r.json();
+    const tbody = document.getElementById('uncat-tbody');
+    if (!rows.length) {
+        tbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-dim);text-align:center;padding:30px">No uncategorized domains yet</td></tr>';
+        return;
+    }
+    const maxHits = Math.max(...rows.map(r => r.hit_count));
+    tbody.innerHTML = rows.map(r => `
+        <tr>
+            <td>${r.domain}</td>
+            <td>
+                <span style="color:${r.hit_count > maxHits * 0.5 ? 'var(--warning)' : 'var(--text)'}">${r.hit_count}</span>
+            </td>
+            <td>${r.first_seen}</td>
+            <td>${r.last_seen}</td>
+            <td>
+                ${r.category
+                    ? `<span class="badge badge-cat">${r.category}</span>`
+                    : `<span style="color:var(--text-dim);font-size:11px">uncategorized</span>`
+                }
+            </td>
+        </tr>
+    `).join('');
+}
+load();
+</script>
+{% endblock %}

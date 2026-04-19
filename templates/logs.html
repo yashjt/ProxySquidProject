@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}Request Logs — ProxyGuard{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div class="page-title">Request Logs</div>
+    <div class="page-sub">All proxy requests — searchable and filterable</div>
+</div>
+
+<div class="card">
+    <div class="filter-bar">
+        <input type="text" id="search" placeholder="Search domain..." oninput="debounceLoad()">
+        <select id="action-filter" onchange="loadLogs()">
+            <option value="">All</option>
+            <option value="ALLOW">Allowed</option>
+            <option value="DENY">Blocked</option>
+        </select>
+        <span id="total-count" style="font-family:var(--mono);font-size:12px;color:var(--text-dim);white-space:nowrap"></span>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Time</th>
+                <th>Domain</th>
+                <th>Category</th>
+                <th>Action</th>
+            </tr>
+        </thead>
+        <tbody id="log-tbody">
+            <tr><td colspan="4" style="color:var(--text-dim);text-align:center;padding:30px">Loading...</td></tr>
+        </tbody>
+    </table>
+
+    <div class="pagination" id="pagination"></div>
+</div>
+
+<script>
+let currentPage = 1;
+let debounceTimer;
+
+function debounceLoad() {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => { currentPage = 1; loadLogs(); }, 400);
+}
+
+async function loadLogs() {
+    const search = document.getElementById('search').value;
+    const action = document.getElementById('action-filter').value;
+    const params = new URLSearchParams({ page: currentPage, per_page: 50, search, action });
+    const r = await fetch('/api/logs?' + params);
+    const d = await r.json();
+
+    document.getElementById('total-count').textContent = d.total.toLocaleString() + ' records';
+
+    const tbody = document.getElementById('log-tbody');
+    if (!d.rows.length) {
+        tbody.innerHTML = '<tr><td colspan="4" style="color:var(--text-dim);text-align:center;padding:30px">No records found</td></tr>';
+    } else {
+        tbody.innerHTML = d.rows.map(r => `
+            <tr>
+                <td>${r.logged_at}</td>
+                <td>${r.domain}</td>
+                <td><span class="badge badge-cat">${r.category || '—'}</span></td>
+                <td><span class="badge ${r.action === 'DENY' ? 'badge-deny' : 'badge-allow'}">${r.action}</span></td>
+            </tr>
+        `).join('');
+    }
+
+    // Pagination
+    const pg = document.getElementById('pagination');
+    pg.innerHTML = '';
+    const prev = document.createElement('button');
+    prev.className = 'page-btn';
+    prev.textContent = '← Prev';
+    prev.disabled = currentPage === 1;
+    prev.onclick = () => { currentPage--; loadLogs(); };
+    pg.appendChild(prev);
+
+    const info = document.createElement('span');
+    info.style.cssText = 'color:var(--text-dim);padding:0 8px;font-family:var(--mono);font-size:12px';
+    info.textContent = `${currentPage} / ${d.pages}`;
+    pg.appendChild(info);
+
+    const next = document.createElement('button');
+    next.className = 'page-btn';
+    next.textContent = 'Next →';
+    next.disabled = currentPage >= d.pages;
+    next.onclick = () => { currentPage++; loadLogs(); };
+    pg.appendChild(next);
+}
+
+loadLogs();
+</script>
+{% endblock %}

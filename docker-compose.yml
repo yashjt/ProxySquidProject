@@ -55,6 +55,23 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  flask-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.flask
+    container_name: squid-ui
+    ports:
+      - "5001:5000"
+    environment:
+      DB_HOST: postgres
+      DB_NAME: squid_categories
+      DB_USER: squid
+      DB_PASSWORD: squidpass
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pgdata:
   squid-logs:
