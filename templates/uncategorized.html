@@ -2,12 +2,11 @@
 {% block title %}Uncategorized — ProxyGuard{% endblock %}
 
 {% block content %}
-<div class="page-header">
-    <div class="page-title">Uncategorized Domains</div>
-    <div class="page-sub">Domains seen by Squid not in the UT1 database — review and categorize</div>
-</div>
 
-<div class="card">
+<h1>Uncategorized Domains</h1>
+<p class="subtitle">Domains Squid saw that are not in the database. Assign them a category so they get properly filtered next time.</p>
+
+<div class="box">
     <table>
         <thead>
             <tr>
@@ -16,41 +15,123 @@
                 <th>First Seen</th>
                 <th>Last Seen</th>
                 <th>Category</th>
+                <th>Action</th>
             </tr>
         </thead>
         <tbody id="uncat-tbody">
-            <tr><td colspan="5" style="color:var(--text-dim);text-align:center;padding:30px">Loading...</td></tr>
+            <tr>
+                <td colspan="6" style="text-align: center; color: #444; padding: 20px;">
+                    Loading...
+                </td>
+            </tr>
         </tbody>
     </table>
 </div>
 
 <script>
-async function load() {
-    const r = await fetch('/api/uncategorized');
-    const rows = await r.json();
-    const tbody = document.getElementById('uncat-tbody');
-    if (!rows.length) {
-        tbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-dim);text-align:center;padding:30px">No uncategorized domains yet</td></tr>';
-        return;
+    // List of all available categories — loaded from the API
+    let allCategories = [];
+
+    // Load all categories first so we can populate the dropdowns
+    async function loadCategories() {
+        const response = await fetch('/api/all_categories');
+        allCategories = await response.json();
     }
-    const maxHits = Math.max(...rows.map(r => r.hit_count));
-    tbody.innerHTML = rows.map(r => `
-        <tr>
-            <td>${r.domain}</td>
-            <td>
-                <span style="color:${r.hit_count > maxHits * 0.5 ? 'var(--warning)' : 'var(--text)'}">${r.hit_count}</span>
-            </td>
-            <td>${r.first_seen}</td>
-            <td>${r.last_seen}</td>
-            <td>
-                ${r.category
-                    ? `<span class="badge badge-cat">${r.category}</span>`
-                    : `<span style="color:var(--text-dim);font-size:11px">uncategorized</span>`
-                }
-            </td>
-        </tr>
-    `).join('');
-}
-load();
+
+    // Load all uncategorized domains from the API
+    async function loadDomains() {
+        const response = await fetch('/api/uncategorized');
+        const rows = await response.json();
+        const tbody = document.getElementById('uncat-tbody');
+
+        // If there's nothing to show, display a message
+        if (rows.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#444;padding:20px">No uncategorized domains yet</td></tr>';
+            return;
+        }
+
+        // Build the dropdown options from our categories list
+        const categoryOptions = allCategories
+            .map(cat => `<option value="${cat}">${cat}</option>`)
+            .join('');
+
+        // Build a table row for each domain
+        tbody.innerHTML = rows.map(row => {
+
+            // If this domain was already categorized manually, just show the badge
+            if (row.category) {
+                return `
+                    <tr id="row-${row.domain.replace(/\./g, '-')}">
+                        <td>${row.domain}</td>
+                        <td>${row.hit_count}</td>
+                        <td>${row.first_seen}</td>
+                        <td>${row.last_seen}</td>
+                        <td><span class="badge b-cat">${row.category}</span></td>
+                        <td style="color:#444">done</td>
+                    </tr>
+                `;
+            }
+
+            // Otherwise show a dropdown + save button
+            return `
+                <tr id="row-${row.domain.replace(/\./g, '-')}">
+                    <td>${row.domain}</td>
+                    <td>${row.hit_count}</td>
+                    <td>${row.first_seen}</td>
+                    <td>${row.last_seen}</td>
+                    <td>
+                        <select id="sel-${row.domain.replace(/\./g, '-')}">
+                            <option value="">-- pick category --</option>
+                            ${categoryOptions}
+                        </select>
+                    </td>
+                    <td>
+                        <button onclick="saveDomain('${row.domain}')">Save</button>
+                    </td>
+                </tr>
+            `;
+        }).join('');
+    }
+
+    // Called when user clicks Save next to a domain
+    async function saveDomain(domain) {
+        // Build the element ID — we replaced dots with dashes when building the table
+        const selectId = 'sel-' + domain.replace(/\./g, '-');
+        const select = document.getElementById(selectId);
+        const category = select.value;
+
+        if (!category) {
+            alert('Please select a category first');
+            return;
+        }
+
+        // POST to the API with the domain and chosen category
+        const response = await fetch(`/api/uncategorized/${domain}/categorize`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ category: category })
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            // Update the row in place so the user sees the change immediately
+            const rowId = 'row-' + domain.replace(/\./g, '-');
+            const row = document.getElementById(rowId);
+            row.cells[4].innerHTML = `<span class="badge b-cat">${category}</span>`;
+            row.cells[5].innerHTML = `<span style="color:#27ae60">saved</span>`;
+        } else {
+            alert('Error: ' + result.error);
+        }
+    }
+
+    // Run both loaders when the page opens
+    async function init() {
+        await loadCategories();
+        await loadDomains();
+    }
+
+    init();
 </script>
+
 {% endblock %}

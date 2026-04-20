@@ -2,12 +2,15 @@
 {% block title %}Dashboard — ProxyGuard{% endblock %}
 
 {% block content %}
+
+
 <div class="page-header">
     <div class="page-title">Dashboard</div>
     <div class="page-sub">Last 24 hours</div>
 </div>
 
-<!-- Stats -->
+
+<!-- Four cards that show key numbers at a glance -->
 <div class="stats-grid">
     <div class="stat-card">
         <div class="stat-label">Total Requests</div>
@@ -27,107 +30,195 @@
     </div>
 </div>
 
+
 <div class="grid-3">
-    <!-- Hourly traffic chart -->
+
+    <!-- Bar chart showing traffic per hour -->
     <div class="card">
         <div class="card-title">Traffic — Last 24 Hours</div>
         <div class="hour-chart" id="hour-chart"></div>
     </div>
 
-    <!-- Top blocked categories -->
     <div class="card">
         <div class="card-title">Top Blocked Categories</div>
         <div id="top-blocked"></div>
     </div>
+
 </div>
 
+
 <div class="grid-2">
-    <!-- Top visited domains -->
+
+    <!-- Most-visited allowed domains -->
     <div class="card">
         <div class="card-title">Top Allowed Domains Today</div>
         <div id="top-domains"></div>
     </div>
 
-    <!-- Live feed -->
+    <!-- Real-time event stream -->
     <div class="card">
         <div class="card-title">
             ● Live Feed
-            <span style="float:right; font-size:10px; color: var(--text-dim)" id="live-count">0 events</span>
+            <span style="float:right; font-size:10px; color: var(--text-dim)" id="live-count">
+                0 events
+            </span>
         </div>
         <div id="live-feed"></div>
     </div>
+
 </div>
 
+<!-- JavaScript -->
 <script>
-let liveCount = 0;
 
-async function loadStats() {
-    const r = await fetch('/api/stats');
-    const d = await r.json();
+    // Globals 
+    // Tracks how many live events have arrived since the page loaded
+    let liveEventCount = 0;
 
-    document.getElementById('stat-total').textContent   = d.totals.total?.toLocaleString() ?? '0';
-    document.getElementById('stat-blocked').textContent = d.totals.blocked?.toLocaleString() ?? '0';
-    document.getElementById('stat-allowed').textContent = d.totals.allowed?.toLocaleString() ?? '0';
-    document.getElementById('stat-db').textContent      = (d.db_size / 1_000_000).toFixed(1) + 'M';
 
-    // Hourly chart
-    const chart = document.getElementById('hour-chart');
-    chart.innerHTML = '';
-    const max = Math.max(...d.hourly.map(h => h.total), 1);
-    d.hourly.forEach(h => {
-        const wrap = document.createElement('div');
-        wrap.className = 'hour-bar-wrap';
-        const pct = Math.round((h.total / max) * 100);
-        wrap.innerHTML = `
-            <div class="hour-bar ${h.blocked > 0 ? 'has-blocked' : ''}" style="height:${pct}%"></div>
-            <div class="hour-label">${h.hour}</div>
+    // ── loadStats() ─────────────────────────────────
+    // Fetches summary data from the server and updates every section of the page.
+    // Called once on load, then every 30 seconds automatically.
+    async function loadStats() {
+
+        // 1. Fetch JSON data from the /api/stats endpoint
+        const response = await fetch('/api/stats');
+        const data     = await response.json();
+
+        // 2. Update the four stat cards ─
+
+        // Show total requests (toLocaleString adds commas: 12345 → "12,345")
+        document.getElementById('stat-total').textContent   = data.totals.total?.toLocaleString()   ?? '0';
+        document.getElementById('stat-blocked').textContent = data.totals.blocked?.toLocaleString() ?? '0';
+        document.getElementById('stat-allowed').textContent = data.totals.allowed?.toLocaleString() ?? '0';
+
+        // Convert raw byte count to millions (e.g. 4500000 → "4.5M")
+        const dbMillions = (data.db_size / 1_000_000).toFixed(1);
+        document.getElementById('stat-db').textContent = dbMillions + 'M';
+
+
+
+        const chartContainer = document.getElementById('hour-chart');
+        chartContainer.innerHTML = ''; // Clear any old bars first
+
+        // Find the tallest bar so we can scale all others relative to it
+        const hourTotals  = data.hourly.map(function(hour) { return hour.total; });
+        const maxRequests = Math.max(...hourTotals, 1); // The "1" avoids dividing by zero
+
+        // Create one bar element per hour
+        data.hourly.forEach(function(hourData) {
+            // Calculate this bar's height as a percentage of the tallest bar
+            const heightPercent = Math.round((hourData.total / maxRequests) * 100);
+
+            // Add a special class if any requests were blocked in that hour
+            const hasBlocked = hourData.blocked > 0 ? 'has-blocked' : '';
+
+            // Build the bar's HTML
+            const barWrapper = document.createElement('div');
+            barWrapper.className   = 'hour-bar-wrap';
+            barWrapper.title       = hourData.hour + ': ' + hourData.total + ' total, ' + hourData.blocked + ' blocked';
+            barWrapper.innerHTML   = `
+                <div class="hour-bar ${hasBlocked}" style="height:${heightPercent}%"></div>
+                <div class="hour-label">${hourData.hour}</div>
+            `;
+
+            chartContainer.appendChild(barWrapper);
+        });
+
+
+        // 4. Build the "Top Blocked Categories" bars ─
+
+        // Find the highest count so other bars scale against it
+        const blockedCounts  = data.top_blocked.map(function(cat) { return cat.count; });
+        const maxBlockedCount = Math.max(...blockedCounts, 1);
+
+        // Build one bar row per category
+        const blockedHTML = data.top_blocked.map(function(category) {
+            const widthPercent = Math.round((category.count / maxBlockedCount) * 100);
+            return `
+                <div class="bar-row">
+                    <div class="bar-label">${category.category}</div>
+                    <div class="bar-track">
+                        <div class="bar-fill danger" style="width:${widthPercent}%"></div>
+                    </div>
+                    <div class="bar-count">${category.count}</div>
+                </div>
+            `;
+        }).join('');
+
+        // If there's nothing to show, display a friendly empty-state message
+        const emptyMessage = '<div style="color:var(--text-dim);font-size:12px;font-family:var(--mono)">No blocked requests today</div>';
+        document.getElementById('top-blocked').innerHTML = blockedHTML || emptyMessage;
+
+
+        // ── 5. Build the "Top Allowed Domains" bars ────
+
+        const domainCounts  = data.top_domains.map(function(domain) { return domain.count; });
+        const maxDomainCount = Math.max(...domainCounts, 1);
+
+        const domainsHTML = data.top_domains.map(function(domainData) {
+            const widthPercent = Math.round((domainData.count / maxDomainCount) * 100);
+            return `
+                <div class="bar-row">
+                    <div class="bar-label">${domainData.domain}</div>
+                    <div class="bar-track">
+                        <div class="bar-fill" style="width:${widthPercent}%"></div>
+                    </div>
+                    <div class="bar-count">${domainData.count}</div>
+                </div>
+            `;
+        }).join('');
+
+        const noDataMessage = '<div style="color:var(--text-dim);font-size:12px;font-family:var(--mono)">No data yet</div>';
+        document.getElementById('top-domains').innerHTML = domainsHTML || noDataMessage;
+    }
+
+
+    // Live Feed (Server-Sent Events)
+    // SSE keeps an open connection to the server.
+    // Every time a new DNS event happens, the server pushes it here automatically.
+    const liveFeedContainer = document.getElementById('live-feed');
+    const eventSource       = new EventSource('/api/live');
+
+    eventSource.onmessage = function(event) {
+
+        // Parse the JSON string the server sent
+        const row = JSON.parse(event.data);
+
+        // Skip rows that contain an error field
+        if (row.error) return;
+
+        // Update the event counter in the header
+        liveEventCount++;
+        document.getElementById('live-count').textContent = liveEventCount + ' events';
+
+        // Decide the badge style: red for DENY, green for ALLOW
+        const badgeClass = (row.action === 'DENY') ? 'badge-deny' : 'badge-allow';
+
+        // Build the new row element
+        const newRow = document.createElement('div');
+        newRow.className = 'live-row';
+        newRow.innerHTML = `
+            <span class="live-time">${row.logged_at}</span>
+            <span class="badge ${badgeClass}">${row.action}</span>
+            <span class="live-domain">${row.domain}</span>
+            <span class="live-cat">${row.category || '—'}</span>
         `;
-        wrap.title = `${h.hour}: ${h.total} total, ${h.blocked} blocked`;
-        chart.appendChild(wrap);
-    });
 
-    // Top blocked
-    const maxBlocked = Math.max(...d.top_blocked.map(c => c.count), 1);
-    document.getElementById('top-blocked').innerHTML = d.top_blocked.map(c => `
-        <div class="bar-row">
-            <div class="bar-label">${c.category}</div>
-            <div class="bar-track"><div class="bar-fill danger" style="width:${Math.round(c.count/maxBlocked*100)}%"></div></div>
-            <div class="bar-count">${c.count}</div>
-        </div>
-    `).join('') || '<div style="color:var(--text-dim);font-size:12px;font-family:var(--mono)">No blocked requests today</div>';
+        // Insert new events at the TOP so the latest is always first
+        liveFeedContainer.insertBefore(newRow, liveFeedContainer.firstChild);
 
-    // Top domains
-    const maxDom = Math.max(...d.top_domains.map(x => x.count), 1);
-    document.getElementById('top-domains').innerHTML = d.top_domains.map(x => `
-        <div class="bar-row">
-            <div class="bar-label">${x.domain}</div>
-            <div class="bar-track"><div class="bar-fill" style="width:${Math.round(x.count/maxDom*100)}%"></div></div>
-            <div class="bar-count">${x.count}</div>
-        </div>
-    `).join('') || '<div style="color:var(--text-dim);font-size:12px;font-family:var(--mono)">No data yet</div>';
-}
+        // Cap the list at 100 rows to avoid the page getting too heavy
+        if (liveFeedContainer.children.length > 100) {
+            liveFeedContainer.removeChild(liveFeedContainer.lastChild);
+        }
+    };
 
-// Live SSE feed
-const feed = document.getElementById('live-feed');
-const evtSource = new EventSource('/api/live');
-evtSource.onmessage = e => {
-    const row = JSON.parse(e.data);
-    if (row.error) return;
-    liveCount++;
-    document.getElementById('live-count').textContent = liveCount + ' events';
-    const div = document.createElement('div');
-    div.className = 'live-row';
-    div.innerHTML = `
-        <span class="live-time">${row.logged_at}</span>
-        <span class="badge ${row.action === 'DENY' ? 'badge-deny' : 'badge-allow'}">${row.action}</span>
-        <span class="live-domain">${row.domain}</span>
-        <span class="live-cat">${row.category || '—'}</span>
-    `;
-    feed.insertBefore(div, feed.firstChild);
-    if (feed.children.length > 100) feed.removeChild(feed.lastChild);
-};
+    // Start 
+    // Load stats immediately when the page opens, then refresh every 30 seconds
+    loadStats();
+    setInterval(loadStats, 30000); // 30000 ms = 30 seconds
 
-loadStats();
-setInterval(loadStats, 30000);
 </script>
+
 {% endblock %}
