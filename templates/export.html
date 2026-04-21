@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}Export — ProxyGuard{% endblock %}
+
+{% block content %}
+
+<h1>Export Data</h1>
+<p class="subtitle">Export logs and categories to .txt files — then download them to your Mac.</p>
+
+<!-- Export buttons -->
+<div class="box">
+    <div class="box-title">Generate Files</div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>File</th>
+                <th>Contents</th>
+                <th>Action</th>
+                <th>Download</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>logs.txt</td>
+                <td style="color:#555;">Last 10,000 requests — timestamp, domain, category, action</td>
+                <td>
+                    <button onclick="exportFile('logs')" id="btn-logs"
+                        style="background:#111;border:1px solid #333;color:#ccc;padding:3px 10px;cursor:pointer;font-family:monospace;font-size:12px;">
+                        Export
+                    </button>
+                </td>
+                <td id="dl-logs"></td>
+            </tr>
+            <tr>
+                <td>categories.txt</td>
+                <td style="color:#555;">All categories with block status and domain counts</td>
+                <td>
+                    <button onclick="exportFile('categories')" id="btn-categories"
+                        style="background:#111;border:1px solid #333;color:#ccc;padding:3px 10px;cursor:pointer;font-family:monospace;font-size:12px;">
+                        Export
+                    </button>
+                </td>
+                <td id="dl-categories"></td>
+            </tr>
+            <tr>
+                <td>url_categories.txt</td>
+                <td style="color:#555;">Category summary + all manually added domain overrides</td>
+                <td>
+                    <button onclick="exportFile('url_categories')" id="btn-url_categories"
+                        style="background:#111;border:1px solid #333;color:#ccc;padding:3px 10px;cursor:pointer;font-family:monospace;font-size:12px;">
+                        Export
+                    </button>
+                </td>
+                <td id="dl-url_categories"></td>
+            </tr>
+            <tr>
+                <td>uncategorized.txt</td>
+                <td style="color:#555;">All uncategorized domains sorted by hit count</td>
+                <td>
+                    <button onclick="exportFile('uncategorized')" id="btn-uncategorized"
+                        style="background:#111;border:1px solid #333;color:#ccc;padding:3px 10px;cursor:pointer;font-family:monospace;font-size:12px;">
+                        Export
+                    </button>
+                </td>
+                <td id="dl-uncategorized"></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div style="margin-top:14px;">
+        <button onclick="exportAll()"
+            style="background:#111;border:1px solid #555;color:#eee;padding:5px 16px;cursor:pointer;font-family:monospace;font-size:12px;">
+            Export All Files
+        </button>
+        <span id="all-status" style="font-size:11px;color:#444;margin-left:10px;"></span>
+    </div>
+</div>
+
+<!-- Terminal commands section -->
+
+
+<script>
+    // Export a single file by calling the API
+    async function exportFile(type) {
+        const btn = document.getElementById('btn-' + type);
+        const dlCell = document.getElementById('dl-' + type);
+
+        // Show loading state
+        btn.textContent = 'Exporting...';
+        btn.disabled = true;
+
+        const response = await fetch('/api/export/' + type, { method: 'POST' });
+        const result = await response.json();
+
+        btn.textContent = 'Export';
+        btn.disabled = false;
+
+        if (result.success) {
+            // Show a download link next to the button
+            dlCell.innerHTML = `
+                <a href="/api/download/${type}"
+                   style="color:#27ae60;font-size:11px;font-family:monospace;"
+                   download="${type}.txt">
+                   Download ${type}.txt
+                </a>
+                <span style="color:#444;font-size:10px;margin-left:6px;">(${result.rows} rows)</span>
+            `;
+        } else {
+            dlCell.innerHTML = `<span style="color:#c0392b;font-size:11px;">${result.error}</span>`;
+        }
+    }
+
+    // Export all 4 files one by one
+    async function exportAll() {
+        const status = document.getElementById('all-status');
+        const types = ['logs', 'categories', 'url_categories', 'uncategorized'];
+
+        status.textContent = 'Exporting...';
+
+        for (const type of types) {
+            await exportFile(type);
+        }
+
+        status.textContent = 'All files exported. Use docker cp to copy to your Mac.';
+        status.style.color = '#27ae60';
+    }
+</script>
+
+{% endblock %}

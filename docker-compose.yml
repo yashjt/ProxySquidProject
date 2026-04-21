@@ -1,51 +1,79 @@
-services:
+# docker-compose.yml
+# This is a master file. It tells all four container how to start and what order to start in 
+#  All 4 containers share a private Docker network, so they can
+#  reach each other by name (e.g. "postgres", "squid-proxy").
+#  No IP addresses needed — Docker handles the routing.
 
+
+
+services:
+  #  SERVICE 1: postgres
+  #  The database that stores everything:
+  #    6 million categorized domains (url_categories)
+  #    which categories are currently blocked (blocked_categories)
+  #    every request Squid has processed (request_log)
+  #    unknown domains we have seen (uncategorized_urls)
+  #    cache version for instant rule updates (cache_version)
   postgres:
-    image: postgres:16
+    image: postgres:16 # used offical postgres version 16 
     container_name: squid-db
     environment:
-      POSTGRES_DB: squid_categories
-      POSTGRES_USER: squid
-      POSTGRES_PASSWORD: squidpass
+      # These variables are read by the postgres image on first startup
+      # to create the database and user automatically
+      POSTGRES_DB: squid_categories # Name of the database
+      POSTGRES_USER: squid # Username for connecting
+      POSTGRES_PASSWORD: squidpass # pass
     volumes:
+      # Mount our schema file INTO the postgres container.
+      # Postgres runs all .sql files in this folder on first startup.
+      # This creates all our tables automatically.
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+
+      # Named volume for persistent storage.
+      # Without this, all data would be lost every time the container restarts.
+
       - pgdata:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "5432:5432" # This  port is for connection my mac to client Host_port:container:port
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U squid -d squid_categories"]
       interval: 5s
       timeout: 5s
       retries: 10
-
+  # Service 2: db_init
+  # it is a container that download from ut1 blacklist website and imports to postgres sql 
   db-init:
     build:
       context: .
       dockerfile: Dockerfile.init
     container_name: squid-db-init
     environment:
-      DB_HOST: postgres
-      DB_NAME: squid_categories
+      DB_HOST: postgres. # container name 
+      DB_NAME: squid_categories # 
       DB_USER: squid
       DB_PASSWORD: squidpass
     depends_on:
       postgres:
-        condition: service_healthy
-    restart: "no"
+        condition: service_healthy # postgres does ot start until it passes the health check 
+    restart: "no" # this means it runs once and exit later 
 
+  # service 3: squid
+  # Firefox connect this to port 3128
+  # it ask squid_helper.py file check wethear the traffic is to blocked or allowed 
+  # it also run niginx on port 8080 for pac file 
   squid:
     build: .
     container_name: squid-proxy
     ports:
-      - "3128:3128"
-      - "8080:8080"
+      - "3128:3128" # firefox connects here
+      - "8080:8080" 
     volumes:
-      - ./squid.conf:/etc/squid/squid.conf:ro
+      - ./squid.conf:/etc/squid/squid.conf:ro.  # Mount config files directly from your Mac into the container.
       - ./squid_helper.py:/usr/local/bin/squid_helper.py
-      - ./proxy.pac:/var/www/pac/proxy.pac:ro
+      - ./proxy.pac:/var/www/pac/proxy.pac:ro.  # ro means read only 
       - squid-logs:/var/log/squid
       - squid-cache:/var/spool/squid
-    environment:
+    environment:  # squid_helper.py reads these to connect to the database 
       DB_HOST: postgres
       DB_NAME: squid_categories
       DB_USER: squid
@@ -53,7 +81,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    restart: unless-stopped
+    restart: unless-stopped 
 
   flask-ui:
     build:

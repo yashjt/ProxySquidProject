@@ -1,89 +1,113 @@
-
-from flask import Flask, render_template, jsonify, request, Response
-
-# psycopg2 — PostgreSQL database driver for Python
+from flask import Flask, render_template, jsonify, request, Response, send_file
 import psycopg2
-import psycopg2.extras   # gives us RealDictCursor (columns by name, not index)
-
-import os        # to read environment variables
-import time      # for sleep() in the live feed loop
-import json      # to serialize data as JSON strings
+import psycopg2.extras
+import subprocess
+import os
+import time
+import json
 from datetime import datetime
 
-# Create the Flask application object
 app = Flask(__name__)
 
-
-# ─ Database Configuration 
-# These values are read from environment variables set in docker-compose.yml.
-# If an env variable is missing, the second argument is the fallback default.
+# Database connection details — read from docker-compose environment variables
 DB_CONFIG = {
-    'host':     os.environ.get('DB_HOST',     'postgres'),
-    'dbname':   os.environ.get('DB_NAME',     'squid_categories'),
-    'user':     os.environ.get('DB_USER',     'squid'),
+    'host':     os.environ.get('DB_HOST', 'postgres'),
+    'dbname':   os.environ.get('DB_NAME', 'squid_categories'),
+    'user':     os.environ.get('DB_USER', 'squid'),
     'password': os.environ.get('DB_PASSWORD', 'squidpass'),
 }
 
+# Folder where exported text files are saved inside the container
+EXPORT_DIR = '/app/exports'
 
-#  Database Helper 
+
 def get_db():
+    # RealDictCursor lets us access columns by name: row['domain'] instead of row[0]
+    return psycopg2.connect(**DB_CONFIG, cursor_factory=psycopg2.extras.RealDictCursor)
+
+
+def increment_cache_version(cur):
     """
-    Opens and returns a new database connection.
-    RealDictCursor means every row comes back as a dictionary,
-    so we can write row['domain'] instead of row[0].
-    We open a fresh connection per request and close it when done.
+    Bump the cache version number so squid_helper.py knows to clear its
+    in-memory cache on its next 30-second check.
+    This is called every time a category is toggled or a domain is re-categorized.
     """
-    connection = psycopg2.connect(**DB_CONFIG, cursor_factory=psycopg2.extras.RealDictCursor)
-    return connection
+    cur.execute("UPDATE cache_version SET version = version + 1 WHERE id = 1")
 
 
+def trigger_squid_reload():
+    """
+    Tell Squid to reload its config without a full restart.
+    This clears Squid's own ACL cache (the ttl= setting in squid.conf).
+    """
+    try:
+        subprocess.run(
+            ['squid', '-k', 'reconfigure'],
+            timeout=5,
+            capture_output=True
+        )
+    except Exception as e:
+        print(f"Squid reconfigure warning: {e}")
 
-#  PAGE ROUTES
 
+def make_file_header(title):
+    """
+    Returns a text header block to put at the top of each exported file.
+    Example output:
+      REQUEST LOGS
+      Generated: 2026-04-20 14:30:00
+    
+    """
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    header  = '=' * 60 + '\n'
+    header += f'  {title}\n'
+    header += f'  Generated: {now}\n'
+    header += '=' * 60 + '\n\n'
+
+    return header
+
+
+# ==============================================================================
+# Page routes — render HTML templates
+# ==============================================================================
 
 @app.route('/')
 def dashboard():
     return render_template('dashboard.html')
 
+
 @app.route('/logs')
 def logs():
     return render_template('logs.html')
 
+
 @app.route('/uncategorized')
 def uncategorized():
     return render_template('uncategorized.html')
+
 
 @app.route('/categories')
 def categories():
     return render_template('categories.html')
 
 
+@app.route('/export')
+def export_page():
+    # New export page — shows buttons to generate and download each file
+    return render_template('export.html')
 
-#  API ROUTES
-#  These routes return JSON data that the frontend JavaScript reads.
-#  Every route follows the same pattern:
-#    1. Open a DB connection
-#    2. Run one or more SQL queries
-#    3. Close the connection
-#    4. Return the data as JSON
+
+# ==============================================================================
+# Stats API — dashboard data
+# ==============================================================================
 
 @app.route('/api/stats')
 def api_stats():
-    """
-    Returns summary numbers for the dashboard:
-      - Total / blocked / allowed request counts (last 24 hours)
-      - Top blocked categories
-      - Top visited allowed domains
-      - Hourly traffic breakdown (for the bar chart)
-      - Total domains in the database
-      - Count of uncategorized domains
-    """
     conn = get_db()
-    cur  = conn.cursor()
+    cur = conn.cursor()
 
-    #  Query 1: Overall totals
-    # CASE WHEN ... THEN 1 ELSE 0 END is like an if/else inside SQL.
-    # SUM counts how many rows matched that condition.
+    # Total, blocked, and allowed requests in the last 24 hours
     cur.execute("""
         SELECT
             COUNT(*) AS total,
@@ -92,9 +116,9 @@ def api_stats():
         FROM request_log
         WHERE logged_at > NOW() - INTERVAL '24 hours'
     """)
-    totals = cur.fetchone()   # fetchone() returns a single row (or None)
+    totals = cur.fetchone()
 
-    #  Query 2: Top 6 most-blocked categories 
+    # Top 6 blocked categories today
     cur.execute("""
         SELECT category, COUNT(*) AS count
         FROM request_log
@@ -104,9 +128,9 @@ def api_stats():
         ORDER BY count DESC
         LIMIT 6
     """)
-    top_blocked = cur.fetchall()  # fetchall() returns a list of rows
+    top_blocked = cur.fetchall()
 
-    #  Query 3: Top 8 most-visited allowed domains 
+    # Top 8 most visited allowed domains today
     cur.execute("""
         SELECT domain, category, COUNT(*) AS count
         FROM request_log
@@ -118,9 +142,7 @@ def api_stats():
     """)
     top_domains = cur.fetchall()
 
-    #  Query 4: Per-hour traffic breakdown 
-    # DATE_TRUNC rounds each timestamp down to the nearest hour,
-    # so all requests within the same hour get grouped together.
+    # Traffic per hour for the bar chart
     cur.execute("""
         SELECT
             DATE_TRUNC('hour', logged_at) AS hour,
@@ -131,87 +153,61 @@ def api_stats():
         GROUP BY hour
         ORDER BY hour
     """)
-    hourly_rows = cur.fetchall()
+    hourly = cur.fetchall()
 
-    #  Query 5: Total domains stored in the database 
     cur.execute("SELECT COUNT(*) AS count FROM url_categories")
-    db_size_row = cur.fetchone()
+    db_size = cur.fetchone()
 
-    #  Query 6: Count of domains Squid couldn't categorize 
-    cur.execute("SELECT COUNT(*) AS count FROM uncategorized_urls")
-    uncat_row = cur.fetchone()
+    cur.execute("SELECT COUNT(*) AS count FROM uncategorized_urls WHERE category IS NULL")
+    uncat_count = cur.fetchone()
 
     conn.close()
 
-    #  Build the hourly list 
-    # Convert each datetime object to a simple "HH:MM" string for the chart labels.
-    hourly_list = []
-    for row in hourly_rows:
-        hourly_list.append({
-            'hour':    row['hour'].strftime('%H:%M'),
-            'total':   row['total'],
-            'blocked': row['blocked'],
-        })
-
-    #  Return everything as a single JSON object 
     return jsonify({
         'totals':      dict(totals),
-        'top_blocked': [dict(row) for row in top_blocked],
-        'top_domains': [dict(row) for row in top_domains],
-        'hourly':      hourly_list,
-        'db_size':     db_size_row['count'],
-        'uncat_count': uncat_row['count'],
+        'top_blocked': [dict(r) for r in top_blocked],
+        'top_domains': [dict(r) for r in top_domains],
+        'hourly': [
+            {
+                'hour':    r['hour'].strftime('%H:%M'),
+                'total':   r['total'],
+                'blocked': r['blocked']
+            }
+            for r in hourly
+        ],
+        'db_size':     db_size['count'],
+        'uncat_count': uncat_count['count'],
     })
 
 
+# ==============================================================================
+# Logs API — paginated, filterable request log
+# ==============================================================================
+
 @app.route('/api/logs')
 def api_logs():
-    """
-    Returns a paginated, filterable list of request log entries.
-
-    URL parameters:
-      page     — which page to show (default: 1)
-      per_page — how many rows per page (default: 50)
-      action   — filter by ALLOW or DENY (default: show all)
-      search   — filter by domain name using a partial match
-    """
-    # Read filter values from the URL query string
-    # e.g. /api/logs?page=2&action=DENY&search=facebook
-    page     = int(request.args.get('page',     1))
+    page     = int(request.args.get('page', 1))
     per_page = int(request.args.get('per_page', 50))
-    action   = request.args.get('action', '')    # 'ALLOW', 'DENY', or '' for all
+    action   = request.args.get('action', '')
     search   = request.args.get('search', '')
-
-    # Calculate how many rows to skip based on the current page number
-    # Page 1 → skip 0 rows, page 2 → skip 50 rows, etc.
-    offset = (page - 1) * per_page
+    offset   = (page - 1) * per_page
 
     conn = get_db()
-    cur  = conn.cursor()
+    cur = conn.cursor()
 
-    #  Build the WHERE clause dynamically 
-    # We start with "1=1" (always true) so we can safely append AND conditions.
-    # Using a list of parts + params list avoids SQL injection.
     where_parts = ["1=1"]
-    params      = []
+    params = []
 
     if action in ('ALLOW', 'DENY'):
         where_parts.append("rl.action = %s")
         params.append(action)
 
     if search:
-        # ILIKE is Postgres case-insensitive LIKE
-        # The % wildcards mean "match anything before or after the search term"
         where_parts.append("rl.domain ILIKE %s")
-        params.append('%' + search + '%')
+        params.append(f'%{search}%')
 
-    # Join all conditions with AND to form the complete WHERE clause
     where_sql = ' AND '.join(where_parts)
 
-    #  Fetch the matching rows 
-    # LEFT JOIN url_categories so category always reflects the current value,
-    # not just what was saved at log time.
-    # COALESCE(a, b) returns a if a is not NULL, otherwise returns b.
     cur.execute(f"""
         SELECT
             rl.id,
@@ -225,97 +221,67 @@ def api_logs():
         ORDER BY rl.logged_at DESC
         LIMIT %s OFFSET %s
     """, params + [per_page, offset])
-
     rows = cur.fetchall()
 
-    #  Count total matching rows (for pagination) 
     cur.execute(f"""
         SELECT COUNT(*) AS count
         FROM request_log rl
         WHERE {where_sql}
     """, params)
-
-    total_rows = cur.fetchone()['count']
+    total = cur.fetchone()['count']
 
     conn.close()
 
-    #  Calculate total pages 
-    # Example: 103 rows / 50 per page = 2.06 → ceil to 3 pages
-    # The formula (total + per_page - 1) // per_page is integer ceiling division
-    total_pages = max(1, (total_rows + per_page - 1) // per_page)
-
-    # Format each row's timestamp as a readable string before sending
-    formatted_rows = []
-    for row in rows:
-        row_dict = dict(row)
-        row_dict['logged_at'] = row['logged_at'].strftime('%Y-%m-%d %H:%M:%S')
-        formatted_rows.append(row_dict)
-
     return jsonify({
-        'rows':  formatted_rows,
-        'total': total_rows,
+        'rows': [
+            {**dict(r), 'logged_at': r['logged_at'].strftime('%Y-%m-%d %H:%M:%S')}
+            for r in rows
+        ],
+        'total': total,
         'page':  page,
-        'pages': total_pages,
+        'pages': max(1, (total + per_page - 1) // per_page),
     })
 
 
-#  /api/uncategorized 
+
 @app.route('/api/uncategorized')
 def api_uncategorized():
-    """
-    Returns up to 200 domains that Squid saw but couldn't match in the database.
-    Sorted by hit_count so the most-visited unknown domains appear first —
-    those are the most useful ones to review and categorize.
-    """
     conn = get_db()
-    cur  = conn.cursor()
+    cur = conn.cursor()
 
     cur.execute("""
         SELECT domain, hit_count, first_seen, last_seen, category, notes
         FROM uncategorized_urls
-        ORDER BY hit_count DESC
+        ORDER BY
+            CASE WHEN category IS NULL THEN 0 ELSE 1 END,
+            hit_count DESC
         LIMIT 200
     """)
     rows = cur.fetchall()
     conn.close()
 
-    # Format the two datetime columns as readable strings
-    formatted_rows = []
-    for row in rows:
-        row_dict = dict(row)
-        row_dict['first_seen'] = row['first_seen'].strftime('%Y-%m-%d %H:%M')
-        row_dict['last_seen']  = row['last_seen'].strftime('%Y-%m-%d %H:%M')
-        formatted_rows.append(row_dict)
+    return jsonify([
+        {
+            **dict(r),
+            'first_seen': r['first_seen'].strftime('%Y-%m-%d %H:%M'),
+            'last_seen':  r['last_seen'].strftime('%Y-%m-%d %H:%M'),
+        }
+        for r in rows
+    ])
 
-    return jsonify(formatted_rows)
 
-
-# ── /api/uncategorized/<domain>/categorize ──────────────────────────────────────
 @app.route('/api/uncategorized/<path:domain>/categorize', methods=['POST'])
 def categorize_domain(domain):
-    """
-    Assigns a category to a previously uncategorized domain.
+    data = request.get_json()
+    category = data.get('category', '').strip()
 
-    Step 1 — Add the domain to url_categories so Squid can find it next time.
-    Step 2 — Update uncategorized_urls to mark this domain as reviewed.
-
-    The <path:domain> part of the route allows dots and slashes in the domain name.
-    """
-    # Read the JSON body the browser sent (e.g. {"category": "social"})
-    request_data = request.get_json()
-    category     = request_data.get('category', '').strip()
-
-    # Reject the request if no category was provided
     if not category:
         return jsonify({'error': 'Category is required'}), 400
 
     conn = get_db()
-    cur  = conn.cursor()
+    cur = conn.cursor()
 
     try:
-        # Insert the domain into url_categories.
-        # ON CONFLICT handles duplicates: if the domain already exists,
-        # just update its category instead of throwing an error.
         cur.execute("""
             INSERT INTO url_categories (domain, category, source)
             VALUES (%s, %s, 'manual')
@@ -323,40 +289,56 @@ def categorize_domain(domain):
             DO UPDATE SET category = %s, source = 'manual'
         """, (domain, category, category))
 
-        # Mark the domain as reviewed in uncategorized_urls
         cur.execute("""
             UPDATE uncategorized_urls
             SET category = %s
             WHERE domain = %s
         """, (category, domain))
 
+        increment_cache_version(cur)
         conn.commit()
         conn.close()
+        trigger_squid_reload()
 
         return jsonify({'success': True, 'domain': domain, 'category': category})
 
-    except Exception as error:
-        # If anything went wrong, undo all changes and return the error message
+    except Exception as e:
         conn.rollback()
         conn.close()
-        return jsonify({'error': str(error)}), 500
+        return jsonify({'error': str(e)}), 500
 
 
-# ── /api/categories (GET) ───────────────────────────────────────────────────────
+@app.route('/api/uncategorized/<path:domain>/remove', methods=['POST'])
+def remove_domain_category(domain):
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("DELETE FROM url_categories WHERE domain = %s AND source = 'manual'", (domain,))
+
+        cur.execute("""
+            UPDATE uncategorized_urls
+            SET category = NULL
+            WHERE domain = %s
+        """, (domain,))
+
+        increment_cache_version(cur)
+        conn.commit()
+        conn.close()
+        trigger_squid_reload()
+
+        return jsonify({'success': True, 'domain': domain})
+
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/categories')
 def api_categories():
-    """
-    Returns every category, along with:
-      - Its description (if one exists)
-      - Whether blocking is currently enabled
-      - How many domains belong to it
-    """
     conn = get_db()
-    cur  = conn.cursor()
+    cur = conn.cursor()
 
-    # LEFT JOIN so categories that exist in url_categories but NOT in
-    # blocked_categories still appear — they just get enabled=FALSE as default.
-    # COALESCE(bc.enabled, FALSE) handles the case where bc row is missing.
     cur.execute("""
         SELECT
             uc.category,
@@ -371,72 +353,49 @@ def api_categories():
     rows = cur.fetchall()
     conn.close()
 
-    return jsonify([dict(row) for row in rows])
+    return jsonify([dict(r) for r in rows])
 
 
-# ── /api/categories (POST) ──────────────────────────────────────────────────────
 @app.route('/api/categories', methods=['POST'])
 def create_category():
-    """
-    Creates a new custom category.
-    Spaces in the name are replaced with underscores
-    so "social media" becomes "social_media".
-    New categories start with blocking enabled (enabled = TRUE).
-    """
-    request_data = request.get_json()
+    data = request.get_json()
+    category    = data.get('category', '').strip().lower().replace(' ', '_')
+    description = data.get('description', '').strip()
 
-    # Normalize the name: lowercase, strip whitespace, replace spaces with underscores
-    category_name = request_data.get('category',    '').strip().lower().replace(' ', '_')
-    description   = request_data.get('description', '').strip()
-
-    if not category_name:
+    if not category:
         return jsonify({'error': 'Category name is required'}), 400
 
     conn = get_db()
-    cur  = conn.cursor()
+    cur = conn.cursor()
 
     try:
-        # Try to insert the new category.
-        # DO NOTHING means if it already exists, skip silently.
-        # RETURNING category only returns a row if the INSERT actually happened.
         cur.execute("""
             INSERT INTO blocked_categories (category, description, enabled)
             VALUES (%s, %s, TRUE)
             ON CONFLICT (category) DO NOTHING
             RETURNING category
-        """, (category_name, description))
+        """, (category, description))
 
-        inserted_row = cur.fetchone()
+        result = cur.fetchone()
         conn.commit()
         conn.close()
 
-        # If fetchone() returned None, the category already existed
-        if inserted_row is None:
+        if result is None:
             return jsonify({'error': 'Category already exists'}), 409
 
-        return jsonify({'success': True, 'category': category_name})
+        return jsonify({'success': True, 'category': category})
 
-    except Exception as error:
+    except Exception as e:
         conn.rollback()
         conn.close()
-        return jsonify({'error': str(error)}), 500
+        return jsonify({'error': str(e)}), 500
 
 
-# ── /api/categories/<category>/toggle ──────────────────────────────────────────
 @app.route('/api/categories/<category>/toggle', methods=['POST'])
 def toggle_category(category):
-    """
-    Flips the blocking state of a category ON → OFF or OFF → ON.
-
-    Also increments the cache version number so squid_helper.py knows
-    to clear its local cache and pick up the change.
-    """
     conn = get_db()
-    cur  = conn.cursor()
+    cur = conn.cursor()
 
-    # INSERT if the category is new, otherwise flip its enabled flag.
-    # NOT blocked_categories.enabled flips TRUE → FALSE or FALSE → TRUE.
-    # RETURNING enabled gives us back the new value after the flip.
     cur.execute("""
         INSERT INTO blocked_categories (category, enabled)
         VALUES (%s, TRUE)
@@ -445,28 +404,19 @@ def toggle_category(category):
         RETURNING enabled
     """, (category,))
 
-    result      = cur.fetchone()
-    new_enabled = result['enabled']
-
-    # Bump the cache version so Squid's helper script detects the change
-    cur.execute("UPDATE cache_version SET version = version + 1 WHERE id = 1")
-
+    result = cur.fetchone()
+    increment_cache_version(cur)
     conn.commit()
     conn.close()
+    trigger_squid_reload()
 
-    return jsonify({'category': category, 'enabled': new_enabled})
+    return jsonify({'category': category, 'enabled': result['enabled']})
 
 
-# ── /api/all_categories ─────────────────────────────────────────────────────────
 @app.route('/api/all_categories')
 def api_all_categories():
-    """
-    Returns a flat list of every unique category name from both tables.
-    UNION automatically removes duplicates.
-    Used to fill the dropdown on the uncategorized page.
-    """
     conn = get_db()
-    cur  = conn.cursor()
+    cur = conn.cursor()
 
     cur.execute("""
         SELECT DISTINCT category
@@ -474,91 +424,362 @@ def api_all_categories():
             SELECT category FROM blocked_categories
             UNION
             SELECT category FROM url_categories
-        ) combined_categories
+        ) combined
         ORDER BY category
     """)
     rows = cur.fetchall()
     conn.close()
 
-    # Return a simple list of strings: ["ads", "malware", "social", ...]
-    category_names = [row['category'] for row in rows]
-    return jsonify(category_names)
+    return jsonify([r['category'] for r in rows])
 
 
-# ── /api/live (Server-Sent Events) ─────────────────────────────────────────────
 @app.route('/api/live')
 def api_live():
-    """
-    Keeps a long-lived HTTP connection open and pushes new log rows
-    to the browser every 2 seconds. This powers the Live Feed on the dashboard.
-
-    SSE (Server-Sent Events) is a one-way stream: server → browser.
-    The browser listens with: const source = new EventSource('/api/live')
-    Each message must follow the format:  data: <json string>\\n\\n
-    """
-
     def generate():
-        # ── Step 1: Find the current latest row ID ───────────────────────────
-        # We only want to stream NEW rows from this point forward,
-        # not replay the entire history.
         conn = get_db()
-        cur  = conn.cursor()
+        cur = conn.cursor()
         cur.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM request_log")
-        last_seen_id = cur.fetchone()['max_id']
+        last_id = cur.fetchone()['max_id']
         conn.close()
 
-        # ── Step 2: Poll for new rows every 2 seconds ────────────────────────
         while True:
             try:
                 conn = get_db()
-                cur  = conn.cursor()
+                cur = conn.cursor()
 
-                # Only fetch rows with an ID higher than the last one we sent
                 cur.execute("""
-                    SELECT id, domain, category, action,
-                           logged_at AT TIME ZONE 'UTC' AS logged_at
-                    FROM request_log
-                    WHERE id > %s
-                    ORDER BY id ASC
+                    SELECT
+                        rl.id,
+                        rl.domain,
+                        COALESCE(uc.category, rl.category) AS category,
+                        rl.action,
+                        rl.logged_at AT TIME ZONE 'UTC' AS logged_at
+                    FROM request_log rl
+                    LEFT JOIN url_categories uc ON uc.domain = rl.domain
+                    WHERE rl.id > %s
+                    ORDER BY rl.id ASC
                     LIMIT 20
-                """, (last_seen_id,))
+                """, (last_id,))
 
-                new_rows = cur.fetchall()
+                rows = cur.fetchall()
                 conn.close()
 
-                # Send each new row to the browser as an SSE message
-                for row in new_rows:
-                    last_seen_id = row['id']   # Advance the cursor
+                for row in rows:
+                    last_id = row['id']
+                    data = json.dumps({
+                        **dict(row),
+                        'logged_at': row['logged_at'].strftime('%H:%M:%S')
+                    })
+                    yield f"data: {data}\n\n"
 
-                    row_dict = dict(row)
-                    row_dict['logged_at'] = row['logged_at'].strftime('%H:%M:%S')
-
-                    # SSE format requires "data: " prefix and double newline at the end
-                    json_string = json.dumps(row_dict)
-                    yield f"data: {json_string}\n\n"
-
-                # Wait 2 seconds before checking for more new rows
                 time.sleep(2)
 
-            except Exception as error:
-                # If anything breaks, send the error to the browser and wait before retrying
-                error_payload = json.dumps({'error': str(error)})
-                yield f"data: {error_payload}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
                 time.sleep(5)
 
-    # Return the generator as a streaming HTTP response
-    # Cache-Control and X-Accel-Buffering prevent proxies from buffering the stream
     return Response(
         generate(),
         mimetype='text/event-stream',
-        headers={
-            'Cache-Control':    'no-cache',
-            'X-Accel-Buffering': 'no',
-        }
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
     )
 
-# Entry Poin
-# This block only runs when you execute "python app.py" directly.
-# When deployed with gunicorn or Docker, this block is skipped.
+
+# ==============================================================================
+# Export API — generate and download text files
+# ==============================================================================
+
+@app.route('/api/export/<export_type>', methods=['POST'])
+def api_export(export_type):
+    """
+    Called when the user clicks an Export button in the UI.
+    Generates a text file and saves it to EXPORT_DIR inside the container.
+    Returns the number of rows written so the UI can show a confirmation.
+    """
+    # Create the exports folder if it doesn't exist yet
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+
+    conn = get_db()
+
+    try:
+        # Call the correct export function based on the type
+        if export_type == 'logs':
+            row_count = export_logs(conn)
+
+        elif export_type == 'categories':
+            row_count = export_categories(conn)
+
+        elif export_type == 'url_categories':
+            row_count = export_url_categories(conn)
+
+        elif export_type == 'uncategorized':
+            row_count = export_uncategorized(conn)
+
+        else:
+            return jsonify({'error': 'Unknown export type'}), 400
+
+        conn.close()
+        return jsonify({'success': True, 'rows': row_count})
+
+    except Exception as e:
+        conn.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/download/<export_type>')
+def api_download(export_type):
+    """
+    Sends the generated text file to the browser as a download.
+    The file must be generated first by calling /api/export/<type>.
+    """
+    filepath = os.path.join(EXPORT_DIR, export_type + '.txt')
+
+    # If the file doesn't exist, tell the user to export it first
+    if not os.path.exists(filepath):
+        return jsonify({'error': 'File not found. Click Export first.'}), 404
+
+    # as_attachment=True triggers a download dialog in the browser
+    return send_file(filepath, as_attachment=True, download_name=export_type + '.txt')
+
+
+# ── Export helper functions ────────────────────────────────────────────────────
+
+def export_logs(conn):
+    """
+    Writes the last 10,000 requests from request_log to logs.txt.
+    Each line: timestamp | action | category | domain
+    """
+    cur = conn.cursor()
+
+    # Get total count so we can show it in the file header
+    cur.execute("SELECT COUNT(*) AS total FROM request_log")
+    total_in_db = cur.fetchone()['total']
+
+    # Fetch most recent 10,000 requests
+    # LEFT JOIN so we always show the current category (not the one at time of request)
+    cur.execute("""
+        SELECT
+            rl.logged_at AT TIME ZONE 'UTC' AS timestamp,
+            rl.domain,
+            COALESCE(uc.category, rl.category, 'uncategorized') AS category,
+            rl.action
+        FROM request_log rl
+        LEFT JOIN url_categories uc ON uc.domain = rl.domain
+        ORDER BY rl.logged_at DESC
+        LIMIT 10000
+    """)
+    rows = cur.fetchall()
+
+    filepath = os.path.join(EXPORT_DIR, 'logs.txt')
+
+    with open(filepath, 'w') as f:
+
+        # File header
+        f.write(make_file_header('REQUEST LOGS'))
+
+        # Summary
+        f.write(f'Total records in database : {total_in_db:,}\n')
+        f.write(f'Records in this file      : {len(rows):,} (most recent first)\n\n')
+
+        # Column headers — fixed-width so columns line up neatly
+        f.write(f'{"TIMESTAMP":<22} {"ACTION":<8} {"CATEGORY":<22} DOMAIN\n')
+        f.write('-' * 80 + '\n')
+
+        # One line per request
+        for row in rows:
+            timestamp = row['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+            action    = row['action']
+            category  = row['category']
+            domain    = row['domain']
+
+            f.write(f'{timestamp:<22} {action:<8} {category:<22} {domain}\n')
+
+        f.write('\nEnd of logs.txt\n')
+
+    return len(rows)
+
+
+def export_categories(conn):
+    """
+    Writes all categories with their current block status to categories.txt.
+    Split into two sections: BLOCKING and ALLOWED.
+    """
+    cur = conn.cursor()
+
+    # Get all categories with enabled status and domain count
+    cur.execute("""
+        SELECT
+            uc.category,
+            COALESCE(bc.description, 'no description') AS description,
+            COALESCE(bc.enabled, FALSE) AS is_blocking,
+            COUNT(uc.id) AS domain_count
+        FROM url_categories uc
+        LEFT JOIN blocked_categories bc ON bc.category = uc.category
+        GROUP BY uc.category, bc.description, bc.enabled
+        ORDER BY domain_count DESC
+    """)
+    all_categories = cur.fetchall()
+
+    # Separate into two lists for the two sections
+    blocking_list = [c for c in all_categories if c['is_blocking']]
+    allowed_list  = [c for c in all_categories if not c['is_blocking']]
+
+    filepath = os.path.join(EXPORT_DIR, 'categories.txt')
+
+    with open(filepath, 'w') as f:
+
+        f.write(make_file_header('CATEGORY STATUS'))
+
+        # Summary counts
+        f.write(f'Total categories  : {len(all_categories)}\n')
+        f.write(f'Currently blocking: {len(blocking_list)}\n')
+        f.write(f'Currently allowed : {len(allowed_list)}\n\n')
+
+        # Section 1 — blocking categories
+        f.write('--- CURRENTLY BLOCKING TRAFFIC ---\n\n')
+        f.write(f'{"CATEGORY":<25} {"DOMAINS":>12}   DESCRIPTION\n')
+        f.write('-' * 65 + '\n')
+
+        if blocking_list:
+            for cat in blocking_list:
+                f.write(f'{cat["category"]:<25} {cat["domain_count"]:>12,}   {cat["description"]}\n')
+        else:
+            f.write('  (nothing is currently blocking)\n')
+
+        # Section 2 — allowed categories
+        f.write('\n--- CURRENTLY ALLOWED ---\n\n')
+        f.write(f'{"CATEGORY":<25} {"DOMAINS":>12}   DESCRIPTION\n')
+        f.write('-' * 65 + '\n')
+
+        for cat in allowed_list:
+            f.write(f'{cat["category"]:<25} {cat["domain_count"]:>12,}   {cat["description"]}\n')
+
+        f.write('\nEnd of categories.txt\n')
+
+    return len(all_categories)
+
+
+def export_url_categories(conn):
+    """
+    Writes a summary of domain counts per category and a full list
+    of manually added/overridden domains to url_categories.txt.
+
+    We don't export all 6M UT1 domains — just the count per category
+    and the manual overrides (which are the ones you control).
+    """
+    cur = conn.cursor()
+
+    # Count domains per category
+    cur.execute("""
+        SELECT category, COUNT(*) AS domain_count
+        FROM url_categories
+        GROUP BY category
+        ORDER BY domain_count DESC
+    """)
+    category_summary = cur.fetchall()
+
+    # Get all manually added/overridden domains
+    cur.execute("""
+        SELECT domain, category, created_at
+        FROM url_categories
+        WHERE source = 'manual'
+        ORDER BY category, domain
+    """)
+    manual_domains = cur.fetchall()
+
+    filepath = os.path.join(EXPORT_DIR, 'url_categories.txt')
+
+    with open(filepath, 'w') as f:
+
+        f.write(make_file_header('URL CATEGORIES'))
+
+        # Total across all categories
+        total = sum(row['domain_count'] for row in category_summary)
+        f.write(f'Total domains in database: {total:,}\n\n')
+
+        # Summary table
+        f.write('--- DOMAIN COUNT PER CATEGORY ---\n\n')
+        f.write(f'{"CATEGORY":<25} {"DOMAINS":>12}\n')
+        f.write('-' * 40 + '\n')
+
+        for row in category_summary:
+            f.write(f'{row["category"]:<25} {row["domain_count"]:>12,}\n')
+
+        # Manual overrides — these are the domains you assigned yourself
+        f.write(f'\n\n--- MANUALLY ADDED DOMAINS ({len(manual_domains)} total) ---\n\n')
+        f.write(f'{"DOMAIN":<40} {"CATEGORY":<25} DATE ADDED\n')
+        f.write('-' * 80 + '\n')
+
+        if manual_domains:
+            for row in manual_domains:
+                date_added = row['created_at'].strftime('%Y-%m-%d') if row['created_at'] else '—'
+                f.write(f'{row["domain"]:<40} {row["category"]:<25} {date_added}\n')
+        else:
+            f.write('  (no manually added domains yet)\n')
+
+        f.write('\nEnd of url_categories.txt\n')
+
+    return len(category_summary)
+
+
+def export_uncategorized(conn):
+    """
+    Writes all uncategorized domains to uncategorized.txt.
+    Split into: PENDING (not yet reviewed) and REVIEWED (category assigned).
+    """
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT domain, hit_count, first_seen, last_seen, category
+        FROM uncategorized_urls
+        ORDER BY
+            CASE WHEN category IS NULL THEN 0 ELSE 1 END,
+            hit_count DESC
+    """)
+    all_domains = cur.fetchall()
+
+    # Split into two groups
+    pending  = [d for d in all_domains if d['category'] is None]
+    reviewed = [d for d in all_domains if d['category'] is not None]
+
+    filepath = os.path.join(EXPORT_DIR, 'uncategorized.txt')
+
+    with open(filepath, 'w') as f:
+
+        f.write(make_file_header('UNCATEGORIZED DOMAINS'))
+
+        f.write(f'Total seen     : {len(all_domains):,}\n')
+        f.write(f'Pending review : {len(pending):,}\n')
+        f.write(f'Reviewed       : {len(reviewed):,}\n\n')
+
+        # Pending review — show hit count and when first/last seen
+        f.write('--- PENDING REVIEW (no category assigned yet) ---\n\n')
+        f.write(f'{"HITS":>6}  {"FIRST SEEN":<18} {"LAST SEEN":<18} DOMAIN\n')
+        f.write('-' * 75 + '\n')
+
+        if pending:
+            for d in pending:
+                first = d['first_seen'].strftime('%Y-%m-%d %H:%M')
+                last  = d['last_seen'].strftime('%Y-%m-%d %H:%M')
+                f.write(f'{d["hit_count"]:>6}  {first:<18} {last:<18} {d["domain"]}\n')
+        else:
+            f.write('  (all domains have been reviewed)\n')
+
+        # Reviewed — show the category that was assigned
+        f.write('\n--- REVIEWED (category assigned) ---\n\n')
+        f.write(f'{"HITS":>6}  {"CATEGORY":<22} DOMAIN\n')
+        f.write('-' * 60 + '\n')
+
+        if reviewed:
+            for d in reviewed:
+                f.write(f'{d["hit_count"]:>6}  {d["category"]:<22} {d["domain"]}\n')
+        else:
+            f.write('  (no domains reviewed yet)\n')
+
+        f.write('\nEnd of uncategorized.txt\n')
+
+    return len(all_domains)
+
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)

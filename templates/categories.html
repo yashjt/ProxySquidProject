@@ -4,22 +4,25 @@
 {% block content %}
 
 <h1>Category Management</h1>
-<p class="subtitle">Toggle the switch to block or unblock a category. Changes apply within 5 minutes. Create custom categories at the bottom.</p>
+<p class="subtitle">
+    Toggle to block or allow traffic per category.
+    Changes apply within 30 seconds — Squid reloads automatically.
+</p>
 
-<!-- Main categories table -->
 <div class="box">
     <table>
         <thead>
             <tr>
                 <th>Category</th>
                 <th>Description</th>
-                <th>Domains in DB</th>
+                <th>Domains</th>
+                <th>Status</th>
                 <th>Block Traffic</th>
             </tr>
         </thead>
         <tbody id="cat-tbody">
             <tr>
-                <td colspan="4" style="text-align: center; color: #444; padding: 20px;">
+                <td colspan="5" style="text-align: center; color: #444; padding: 20px;">
                     Loading...
                 </td>
             </tr>
@@ -27,64 +30,38 @@
     </table>
 </div>
 
-<!-- Form to create a new custom category -->
-<!-- <div class="box">
-    <div class="box-title">Create New Category</div>
-
-    <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
-        <input
-            type="text"
-            id="new-cat-name"
-            placeholder="Category name (e.g. sports)"
-            style="background: #0d0d0d; border: 1px solid #222; color: #ccc; padding: 5px 8px; font-family: monospace; font-size: 12px; flex: 1; min-width: 150px;"
-        />
-        <input
-            type="text"
-            id="new-cat-desc"
-            placeholder="Description (optional)"
-            style="background: #0d0d0d; border: 1px solid #222; color: #ccc; padding: 5px 8px; font-family: monospace; font-size: 12px; flex: 2; min-width: 200px;"
-        />
-        <button
-            onclick="createCategory()"
-            style="background: #111; border: 1px solid #333; color: #ccc; padding: 5px 12px; cursor: pointer; font-family: monospace; font-size: 12px; white-space: nowrap;"
-        >
-            + Create
-        </button>
-    </div> -->
-
-    <!-- Shows success or error message after clicking Create -->
-    <div id="create-status" style="margin-top: 8px; font-size: 11px; color: #444;"></div>
-</div>
-
 <script>
-    // Load all categories from the API and render them into the table
     async function loadCategories() {
         const response = await fetch('/api/categories');
         const rows = await response.json();
         const tbody = document.getElementById('cat-tbody');
 
         if (rows.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#444;padding:20px">No categories found</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#444;padding:20px">No categories found. Browse some websites first.</td></tr>';
             return;
         }
 
         tbody.innerHTML = rows.map(function(cat) {
+            // Status label — makes it easy to scan which categories are blocking
+            const statusHtml = cat.enabled
+                ? '<span style="color:#c0392b;font-size:11px;font-weight:bold;">BLOCKING</span>'
+                : '<span style="color:#444;font-size:11px;">allowed</span>';
+
             return `
                 <tr>
-                    <td>
-                        <span class="badge-cat">${cat.category}</span>
-                    </td>
-                    <td style="color: #555;">
-                        ${cat.description || '—'}
-                    </td>
-                    <td>
-                        ${cat.domain_count.toLocaleString()}
-                    </td>
+                    <td>${cat.category}</td>
+                    <td style="color: #555;">${cat.description || '—'}</td>
+                    <td>${cat.domain_count.toLocaleString()}</td>
+                    <td>${statusHtml}</td>
                     <td>
                         <!--
-                            Toggle switch — when checked, traffic to this category is BLOCKED.
-                            The red color means blocking is active.
-                            Calling toggleCategory() sends the change to the database.
+                            Toggle switch.
+                            RED (checked) = this category is currently BLOCKING traffic.
+                            GREY (unchecked) = traffic to this category is ALLOWED.
+                            Flipping the toggle calls the API, which:
+                              1. Updates blocked_categories.enabled in the DB
+                              2. Increments cache_version so squid_helper.py reloads rules
+                              3. Calls squid -k reconfigure to clear Squid's own cache
                         -->
                         <label class="toggle">
                             <input
@@ -100,60 +77,27 @@
         }).join('');
     }
 
-    // Called when user flips a toggle switch
     async function toggleCategory(category, checkbox) {
-        // Send POST request to flip the enabled flag in the database
+        // Disable checkbox while the API call is in progress to prevent double-clicks
+        checkbox.disabled = true;
+
         const response = await fetch('/api/categories/' + category + '/toggle', {
             method: 'POST'
         });
 
         const result = await response.json();
 
-        // Set the checkbox to whatever the database actually saved
-        // This prevents the UI from showing wrong state if the API call failed
-        checkbox.checked = result.enabled;
-    }
-
-    // Called when user clicks the + Create button
-    async function createCategory() {
-        const nameInput   = document.getElementById('new-cat-name');
-        const descInput   = document.getElementById('new-cat-desc');
-        const statusDiv   = document.getElementById('create-status');
-
-        const name = nameInput.value.trim();
-        const desc = descInput.value.trim();
-
-        // Simple validation before hitting the API
-        if (!name) {
-            statusDiv.style.color = '#c0392b';
-            statusDiv.textContent = 'Category name cannot be empty.';
-            return;
+        if (result.error) {
+            alert('Error: ' + result.error);
+            checkbox.checked = !checkbox.checked;  // revert on error
         }
 
-        const response = await fetch('/api/categories', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ category: name, description: desc })
-        });
+        checkbox.disabled = false;
 
-        const result = await response.json();
-
-        if (result.success) {
-            // Clear inputs and show success message
-            nameInput.value = '';
-            descInput.value = '';
-            statusDiv.style.color = '#27ae60';
-            statusDiv.textContent = 'Category "' + result.category + '" created. Toggle is ON (blocking) by default.';
-
-            // Reload the table so the new category appears immediately
-            loadCategories();
-        } else {
-            statusDiv.style.color = '#c0392b';
-            statusDiv.textContent = 'Error: ' + result.error;
-        }
+        // Reload the whole table so the Status column updates too
+        loadCategories();
     }
 
-    // Load the table when the page first opens
     loadCategories();
 </script>
 

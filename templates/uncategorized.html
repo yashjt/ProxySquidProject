@@ -4,9 +4,18 @@
 {% block content %}
 
 <h1>Uncategorized Domains</h1>
-<p class="subtitle">Domains Squid saw that are not in the database. Assign them a category so they get properly filtered next time.</p>
+<p class="subtitle">
+    Domains Squid has seen but not yet categorized.
+    Assign a category to control how they are filtered.
+    You can also remove a domain from its category to move it back here.
+</p>
 
 <div class="box">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+        <div class="box-title" style="margin-bottom: 0;">Pending Review</div>
+        <div id="count-label" style="font-size: 11px; color: #444;"></div>
+    </div>
+
     <table>
         <thead>
             <tr>
@@ -29,84 +38,100 @@
 </div>
 
 <script>
-    // List of all available categories — loaded from the API
+    // All available categories — loaded once and reused for every dropdown
     let allCategories = [];
 
-    // Load all categories first so we can populate the dropdowns
+    // Step 1: Load all category names for the dropdown menus
     async function loadCategories() {
         const response = await fetch('/api/all_categories');
         allCategories = await response.json();
     }
 
-    // Load all uncategorized domains from the API
+    // Step 2: Load all uncategorized domains and build the table
     async function loadDomains() {
         const response = await fetch('/api/uncategorized');
         const rows = await response.json();
         const tbody = document.getElementById('uncat-tbody');
+        const countLabel = document.getElementById('count-label');
 
-        // If there's nothing to show, display a message
         if (rows.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#444;padding:20px">No uncategorized domains yet</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#444;padding:20px">No uncategorized domains yet. Browse some websites!</td></tr>';
             return;
         }
 
-        // Build the dropdown options from our categories list
-        const categoryOptions = allCategories
-            .map(cat => `<option value="${cat}">${cat}</option>`)
+        // Count how many still need review
+        const pending = rows.filter(function(r) { return !r.category; }).length;
+        countLabel.textContent = pending + ' pending review';
+
+        // Build dropdown HTML from the loaded categories list
+        const optionsHtml = allCategories
+            .map(function(cat) { return '<option value="' + cat + '">' + cat + '</option>'; })
             .join('');
 
-        // Build a table row for each domain
-        tbody.innerHTML = rows.map(row => {
+        tbody.innerHTML = rows.map(function(row) {
+            const domainId = row.domain.replace(/\./g, '-').replace(/:/g, '-');
 
-            // If this domain was already categorized manually, just show the badge
+            // If already categorized, show the badge and a Remove button
             if (row.category) {
                 return `
-                    <tr id="row-${row.domain.replace(/\./g, '-')}">
+                    <tr id="row-${domainId}">
                         <td>${row.domain}</td>
                         <td>${row.hit_count}</td>
                         <td>${row.first_seen}</td>
                         <td>${row.last_seen}</td>
-                        <td><span class="badge b-cat">${row.category}</span></td>
-                        <td style="color:#444">done</td>
+                        <td>
+                            <span style="color: #27ae60;">${row.category}</span>
+                        </td>
+                        <td>
+                            <button
+                                onclick="removeDomain('${row.domain}')"
+                                style="background:#111; border:1px solid #3d1010; color:#c0392b; padding:2px 8px; cursor:pointer; font-family:monospace; font-size:11px;"
+                            >
+                                Remove
+                            </button>
+                        </td>
                     </tr>
                 `;
             }
 
-            // Otherwise show a dropdown + save button
+            // If not categorized yet, show a dropdown and a Save button
             return `
-                <tr id="row-${row.domain.replace(/\./g, '-')}">
+                <tr id="row-${domainId}">
                     <td>${row.domain}</td>
                     <td>${row.hit_count}</td>
                     <td>${row.first_seen}</td>
                     <td>${row.last_seen}</td>
                     <td>
-                        <select id="sel-${row.domain.replace(/\./g, '-')}">
+                        <select id="sel-${domainId}">
                             <option value="">-- pick category --</option>
-                            ${categoryOptions}
+                            ${optionsHtml}
                         </select>
                     </td>
                     <td>
-                        <button onclick="saveDomain('${row.domain}')">Save</button>
+                        <button
+                            onclick="saveDomain('${row.domain}')"
+                            style="background:#111; border:1px solid #333; color:#ccc; padding:2px 8px; cursor:pointer; font-family:monospace; font-size:11px;"
+                        >
+                            Save
+                        </button>
                     </td>
                 </tr>
             `;
         }).join('');
     }
 
-    // Called when user clicks Save next to a domain
+    // Called when user clicks Save — assigns the selected category to the domain
     async function saveDomain(domain) {
-        // Build the element ID — we replaced dots with dashes when building the table
-        const selectId = 'sel-' + domain.replace(/\./g, '-');
-        const select = document.getElementById(selectId);
+        const domainId = domain.replace(/\./g, '-').replace(/:/g, '-');
+        const select = document.getElementById('sel-' + domainId);
         const category = select.value;
 
         if (!category) {
-            alert('Please select a category first');
+            alert('Please select a category first.');
             return;
         }
 
-        // POST to the API with the domain and chosen category
-        const response = await fetch(`/api/uncategorized/${domain}/categorize`, {
+        const response = await fetch('/api/uncategorized/' + domain + '/categorize', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ category: category })
@@ -115,11 +140,33 @@
         const result = await response.json();
 
         if (result.success) {
-            // Update the row in place so the user sees the change immediately
-            const rowId = 'row-' + domain.replace(/\./g, '-');
-            const row = document.getElementById(rowId);
-            row.cells[4].innerHTML = `<span class="badge b-cat">${category}</span>`;
-            row.cells[5].innerHTML = `<span style="color:#27ae60">saved</span>`;
+            // Update the row in place — no need to reload the whole page
+            const row = document.getElementById('row-' + domainId);
+            row.cells[4].innerHTML = '<span style="color:#27ae60;">' + category + '</span>';
+            row.cells[5].innerHTML = `
+                <button
+                    onclick="removeDomain('${domain}')"
+                    style="background:#111; border:1px solid #3d1010; color:#c0392b; padding:2px 8px; cursor:pointer; font-family:monospace; font-size:11px;"
+                >
+                    Remove
+                </button>
+            `;
+        } else {
+            alert('Error: ' + result.error);
+        }
+    }
+
+    // Called when user clicks Remove — moves the domain back to uncategorized
+    async function removeDomain(domain) {
+        const response = await fetch('/api/uncategorized/' + domain + '/remove', {
+            method: 'POST'
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            // Reload so the row shows the dropdown again
+            loadDomains();
         } else {
             alert('Error: ' + result.error);
         }
