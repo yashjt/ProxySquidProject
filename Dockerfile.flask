@@ -2,9 +2,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir flask psycopg2-binary
+# requests is needed by web_classifier.py to fetch webpages
+RUN pip install --no-cache-dir flask psycopg2-binary requests
 
 COPY app.py .
+COPY web_classifier.py .      
 COPY templates/ templates/
 
 EXPOSE 5000

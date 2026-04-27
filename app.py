@@ -6,6 +6,10 @@ import os
 import time
 import json
 from datetime import datetime
+from web_classifier import classify_with_details
+import logging
+log = logging.getLogger(__name__)
+
 
 app = Flask(__name__)
 
@@ -780,6 +784,123 @@ def export_uncategorized(conn):
 
     return len(all_domains)
 
+
+@app.route('/classify')
+def classify_page():
+    """Page to manually test domain classification."""
+    return render_template('classify.html')
+
+
+@app.route('/api/classify/<path:domain>', methods=['POST'])
+def api_classify(domain):
+    """
+    Manually trigger classification for any domain.
+    Returns full scoring details — useful for debugging and
+    showing the mentor why a site was classified a certain way.
+
+    Example: POST /api/classify/wsj.com
+    Returns:
+    {
+        "domain":     "wsj.com",
+        "category":   "news",
+        "score":      14,
+        "confidence": "high",
+        "all_scores": {"news": 14, "finance": 6, ...},
+        "content": {
+            "title":    "The Wall Street Journal",
+            "meta":     "breaking news, markets...",
+            "headings": ["Markets", "Economy"]
+        },
+        "elapsed_seconds": 1.4
+    }
+    """
+    try:
+        from web_classifier import classify_with_details
+        result = classify_with_details(domain)
+
+        # If we got a real category (not uncategorized), save it
+        if result['category'] != 'uncategorized':
+            conn = get_db()
+            cur  = conn.cursor()
+            cur.execute("""
+                INSERT INTO url_categories (domain, category, source)
+                VALUES (%s, %s, 'manual_classify')
+                ON CONFLICT (domain)
+                DO UPDATE SET
+                    category = EXCLUDED.category,
+                    source   = 'manual_classify'
+            """, (domain, result['category']))
+            increment_cache_version(cur)
+            conn.commit()
+            conn.close()
+            trigger_squid_reload()
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/classify/batch', methods=['POST'])
+def api_classify_batch():
+    """
+    Classify all domains currently in uncategorized_urls.
+    Runs in the background — returns immediately.
+    Check the categorizer.log for progress.
+    """
+    def run_batch():
+        try:
+            from web_classifier import classify_domain
+
+            conn = get_db()
+            cur  = conn.cursor()
+
+            # Get all domains that are still uncategorized
+            cur.execute("""
+                SELECT domain FROM uncategorized_urls
+                WHERE category IS NULL
+                ORDER BY hit_count DESC
+                LIMIT 100
+            """)
+            domains = [row['domain'] for row in cur.fetchall()]
+            conn.close()
+
+            log.info(f"Batch classification starting for {len(domains)} domains")
+
+            for domain in domains:
+                try:
+                    category = classify_domain(domain)
+
+                    if category != 'uncategorized':
+                        conn2 = get_db()
+                        cur2  = conn2.cursor()
+                        cur2.execute("""
+                            INSERT INTO url_categories (domain, category, source)
+                            VALUES (%s, %s, 'batch_classify')
+                            ON CONFLICT (domain)
+                            DO UPDATE SET category = EXCLUDED.category, source = 'batch_classify'
+                        """, (domain, category))
+                        cur2.execute("""
+                            UPDATE uncategorized_urls SET category = %s WHERE domain = %s
+                        """, (category, domain))
+                        increment_cache_version(cur2)
+                        conn2.commit()
+                        conn2.close()
+
+                except Exception as e:
+                    log.error(f"Batch classify error for {domain}: {e}")
+                    continue
+
+            log.info("Batch classification complete")
+
+        except Exception as e:
+            log.error(f"Batch classification failed: {e}")
+
+    import threading
+    thread = threading.Thread(target=run_batch, daemon=True)
+    thread.start()
+
+    return jsonify({'success': True, 'message': 'Batch classification started. Check categorizer.log for progress.'})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)

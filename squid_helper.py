@@ -1,58 +1,45 @@
 #!/usr/bin/env python3
-
+# ============================================================
 #  squid_helper.py  —  Squid External ACL Helper
+#                      (with auto web classification)
 #
-#  PURPOSE:
-#  This script is the decision engine of the proxy.
-#  Squid spawns it as a child process when it starts up,
-#  and communicates with it through stdin/stdout using a
-#  simple text protocol:
+#  NEW in this version:
+#  When a domain is NOT in the url_categories database,
+#  instead of just logging it as "uncategorized", we now:
+#    1. Call web_classifier.classify_domain(domain)
+#    2. Fetch the page, extract content, score against keywords
+#    3. Get a category back (e.g. "news", "technology")
+#    4. Save it to url_categories in PostgreSQL
+#    5. Apply the category to the allow/block decision immediately
 #
-#    Squid → helper (via stdin):   "facebook.com"
-#    helper → Squid (via stdout):  "ERR"
-#
-#    Squid → helper (via stdin):   "bet365.com"
-#    helper → Squid (via stdout):  "OK"
-#
-#  THE PROTOCOL (very important to understand):
-#    OK  = "this ACL condition is TRUE"  = Squid will BLOCK the request
-#    ERR = "this ACL condition is FALSE" = Squid will ALLOW the request
-#
-#  This is counterintuitive but it is the Squid standard.
-#  In squid.conf we have: "http_access deny blocked_url"
-#  blocked_url ACL fires when helper returns OK → request denied.
-#
-#  CRITICAL RULE:
-#  NEVER print anything to stdout except "OK" or "ERR".
-#  If any other text reaches stdout, Squid reads it as a malformed
-#  response and kills the helper process. All debugging goes to
-#  the log FILE instead.
-#
+#  This runs in a background thread so it does NOT slow down
+#  the Squid response. The first visit is decided as
+#  "uncategorized → ALLOW", then classification runs async.
+#  The SECOND visit uses the now-stored category.
+# ============================================================
+
+import sys
+import os
+import logging
+import threading          # NEW: run classification in background thread
+import psycopg2
+from datetime import datetime
+
+# Import our web classifier module (must be in the same folder)
+try:
+    from web_classifier import classify_domain
+    CLASSIFIER_AVAILABLE = True
+except ImportError:
+    CLASSIFIER_AVAILABLE = False
+    # If the module is missing, we just fall back to old behaviour
 
 
-
-import sys      # sys.stdin to read domains, sys.stderr for fallback logging
-import os       # os.environ to read DB credentials
-import logging  # write timestamped log messages to a file
-import psycopg2 # PostgreSQL database driver
-from datetime import datetime  # track time for periodic cache checks
-
-
-#  Logging Setup 
-# We MUST write logs to a file (not stdout) because stdout is reserved
-# for communicating with Squid. Even a single extra character on stdout
-# would corrupt the protocol and cause Squid to kill the helper.
-#
-# We try to open the log file first. If it fails (e.g. permissions issue),
-# we fall back to stderr, which Docker captures in "docker compose logs squid".
-
+# ── Logging ────────────────────────────────────────────────────────────────────
 log_file = '/var/log/squid/categorizer.log'
 handlers = []
-
 try:
     handlers.append(logging.FileHandler(log_file))
 except Exception:
-    # Could not open the log file — fall back to stderr
     handlers.append(logging.StreamHandler(sys.stderr))
 
 logging.basicConfig(
@@ -63,146 +50,109 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-#  Database Configuration 
-# Credentials are passed as environment variables in docker-compose.yml.
-# os.environ.get(key, default) reads the variable or uses the default
-# if the variable is not set — useful for running locally without Docker.
+# ── Database config ────────────────────────────────────────────────────────────
 DB_CONFIG = {
     'host':            os.environ.get('DB_HOST', 'postgres'),
     'dbname':          os.environ.get('DB_NAME', 'squid_categories'),
     'user':            os.environ.get('DB_USER', 'squid'),
     'password':        os.environ.get('DB_PASSWORD', 'squidpass'),
-    'connect_timeout': 5,   # give up connecting after 5 seconds
+    'connect_timeout': 5,
 }
 
-
-#  In-Memory Cache 
-# This is a simple Python dictionary that maps domain names to their
-# Squid responses ('OK' or 'ERR').
-#
-# Example after processing a few requests:
-#   _cache = {
-#       'facebook.com': 'ERR',   # allowed (social_networks not blocked)
-#       'bet365.com':   'OK',    # blocked (gambling)
-#       'google.com':   'ERR',   # allowed (search_engine not blocked)
-#   }
-#
-# Why use this?
-# Without caching, every single HTTP request would cause a PostgreSQL
-# query. A single page load can trigger 50-100 requests (for images,
-# scripts, fonts, etc.). That is thousands of DB queries per minute.
-# The cache reduces this to one query per unique domain.
-#
-# CACHE_MAX prevents the dict from growing forever in long-running sessions.
+# In-memory cache: domain → Squid response ('OK' = block, 'ERR' = allow)
 _cache = {}
 CACHE_MAX = 10000
 
-#  Cache Version Tracking 
-# When a user toggles a category in the Flask UI, Flask increments the
-# version number in the cache_version database table.
-#
-# This script reads that number every 30 seconds. If it changed,
-# we clear _cache and reload blocked_categories from the DB.
-# This ensures new blocking rules apply within 30 seconds.
-#
-# Without this mechanism, cached results would keep old rules
-# indefinitely and category toggles would have no effect.
-_known_cache_version = 0   # The last version number we read from the DB
+# Tracks cache version for real-time toggle updates
+_known_cache_version = 0
+
+# Set of domains currently being classified in background threads.
+# Prevents launching multiple classification jobs for the same domain.
+_classifying_in_progress = set()
 
 
-#  Database Connection 
+# ── Database helpers ───────────────────────────────────────────────────────────
+
 def get_db_connection():
-    """Open and return a new connection to PostgreSQL."""
     return psycopg2.connect(**DB_CONFIG)
 
 
-#  Load Blocked Categories 
 def get_blocked_categories(conn):
-    """
-    Fetch all category names where enabled = TRUE from the DB.
-
-    Example return value:
-      {'gambling', 'adult', 'malware', 'phishing'}
-    """
+    """Returns set of category names where enabled = TRUE."""
     with conn.cursor() as cur:
         cur.execute(
             "SELECT category FROM blocked_categories WHERE enabled = TRUE"
         )
-        # Build a set from the query results
-        # cur.fetchall() returns: [('gambling',), ('adult',), ...]
-        # row[0] extracts just the string from each tuple
         return {row[0] for row in cur.fetchall()}
 
 
-#  Cache Version Check 
 def get_cache_version(conn):
-    """
-    Read the current version number from the cache_version table.
-    """
+    """Returns the current cache version number."""
     with conn.cursor() as cur:
         cur.execute("SELECT version FROM cache_version WHERE id = 1")
         row = cur.fetchone()
         return row[0] if row else 0
 
 
-#  Domain Lookup 
 def lookup_domain(conn, domain, blocked_cats):
     """
-    Look up a domain in the url_categories table.
-
-    SUBDOMAIN MATCHING:
-    We don't just search for the exact domain. We also try progressively
-    shorter versions by stripping subdomains one level at a time.
-
-    Example for "mail.google.com":
-      Attempt 1: query for "mail.google.com" → not found
-      Attempt 2: query for "google.com" → found! category = search_engine
-
-    This means adding "google.com" to the DB automatically covers
-    maps.google.com, mail.google.com, drive.google.com, etc.
-
-    Arguments:
-      conn         - open database connection
-      domain       - cleaned domain string, e.g. "mail.google.com"
-      blocked_cats - set of currently blocked category names
-
-    Returns:
-      (action, category) where action is 'DENY' or 'ALLOW'
+    Tries exact match then progressive subdomain stripping.
+    e.g. mail.google.com → google.com
+    Returns (action, category).
     """
-    # Split domain into parts: "mail.google.com" → ["mail", "google", "com"]
     parts = domain.split('.')
-
-    # Try each progressively shorter candidate
-    # range(len(parts) - 1) stops before trying just "com" alone
     for i in range(len(parts) - 1):
-        candidate = '.'.join(parts[i:])  # rejoin from position i onward
-
+        candidate = '.'.join(parts[i:])
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT category FROM url_categories WHERE domain = %s LIMIT 1",
                 (candidate,)
             )
             row = cur.fetchone()
-
             if row:
                 category = row[0]
-                # Check if this category is currently enabled for blocking
                 action = 'DENY' if category in blocked_cats else 'ALLOW'
                 return action, category
 
-    # Domain was not found in the database at all
     return 'ALLOW', 'uncategorized'
 
 
-#  Log Uncategorized Domains 
-def log_uncategorized(conn, domain):
+def save_classification(domain, category):
     """
-    Record that we saw a domain not in our database.
-    The Flask UI shows these in the "Uncategorized" page for manual review.
+    Save a newly classified domain to url_categories.
+    Called from the background classification thread.
+    """
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
 
-    Uses INSERT ON CONFLICT so we just increment the hit_count
-    if we've seen this domain before, rather than inserting a duplicate.
-    """
+        cur.execute("""
+            INSERT INTO url_categories (domain, category, source)
+            VALUES (%s, %s, 'auto_classified')
+            ON CONFLICT (domain)
+            DO UPDATE SET
+                category = EXCLUDED.category,
+                source   = 'auto_classified'
+        """, (domain, category))
+
+        # Also update the uncategorized_urls record if it exists
+        cur.execute("""
+            UPDATE uncategorized_urls
+            SET category = %s
+            WHERE domain = %s
+        """, (category, domain))
+
+        conn.commit()
+        conn.close()
+
+        log.info(f"Auto-classified and saved: {domain} → {category}")
+
+    except Exception as e:
+        log.error(f"Could not save classification for {domain}: {e}")
+
+
+def log_uncategorized(conn, domain):
+    """Records an unknown domain in uncategorized_urls for review."""
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -216,15 +166,11 @@ def log_uncategorized(conn, domain):
         conn.commit()
     except Exception as e:
         conn.rollback()
-        log.warning(f"Could not log uncategorized domain {domain}: {e}")
+        log.warning(f"Could not log uncategorized {domain}: {e}")
 
 
-#  Log Every Request 
 def log_request(conn, domain, category, action):
-    """
-    Write a record to request_log for every request Squid processes.
-    This powers the logs page and dashboard charts in the Flask UI.
-    """
+    """Writes every request to request_log for the dashboard."""
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -237,154 +183,165 @@ def log_request(conn, domain, category, action):
         log.warning(f"Could not write request log for {domain}: {e}")
 
 
-#  Response Translation 
 def squid_response(action):
     """
-    Translate our internal 'DENY'/'ALLOW' decision into
-    Squid's external ACL protocol response.
-
-    In squid.conf:  "http_access deny blocked_url"
-    The blocked_url ACL fires when this helper returns OK.
-    So returning OK causes Squid to BLOCK the request.
-
-    Returning ERR means "this ACL did not match" — Squid falls through
-    to the next rule, which is "http_access allow all" → request allowed.
-
-    DENY action  → return 'OK'  → Squid blocks  
-    ALLOW action → return 'ERR' → Squid allows  
+    Translates action to Squid protocol.
+    DENY → OK  (blocked_url ACL matches → Squid blocks)
+    ALLOW → ERR (ACL does not match → Squid allows)
     """
     return 'OK' if action == 'DENY' else 'ERR'
 
 
-# Main Processing Loop 
-def main():
-    """
-    The main loop. Runs forever, reading one domain per line from stdin
-    and writing one response per line to stdout.
+# ── Background classification ──────────────────────────────────────────────────
 
-    Squid keeps this process alive for the entire time it is running.
-    If this process dies, Squid logs a warning and starts a new one.
+def classify_in_background(domain, blocked_cats):
     """
-    # These are declared global so we can reassign them inside the loop
+    Runs web_classifier in a background thread.
+
+    WHY BACKGROUND?
+    Fetching and analysing a webpage takes 1-3 seconds.
+    Squid cannot wait that long — it would make the browser hang.
+
+    So for the FIRST visit to an unknown domain:
+      - We immediately return ALLOW (or DENY if uncategorized default is deny)
+      - We start this background thread to classify the site
+      - The result is saved to the database
+      - The SECOND visit uses the stored category and is instant
+
+    Arguments:
+        domain       — the domain to classify
+        blocked_cats — current set of blocked categories (to decide on next visit)
+    """
+    try:
+        # Prevent duplicate classification jobs for the same domain
+        if domain in _classifying_in_progress:
+            return
+        _classifying_in_progress.add(domain)
+
+        log.info(f"Starting background classification for: {domain}")
+
+        # Run the classifier (1-3 seconds)
+        category = classify_domain(domain)
+
+        # Save to database
+        save_classification(domain, category)
+
+        # Update the in-memory cache with the new result
+        # So the very next request uses the real category
+        action   = 'DENY' if category in blocked_cats else 'ALLOW'
+        response = squid_response(action)
+        if len(_cache) < CACHE_MAX:
+            _cache[domain] = response
+
+        log.info(f"Background classification done: {domain} → {category} → {action}")
+
+    except Exception as e:
+        log.error(f"Background classification failed for {domain}: {e}")
+
+    finally:
+        # Always remove from the in-progress set when done
+        _classifying_in_progress.discard(domain)
+
+
+# ── Main loop ──────────────────────────────────────────────────────────────────
+
+def main():
     global _cache, _known_cache_version
 
-    conn = None           # database connection
-    blocked_cats = set()  # set of currently blocked category names
-    last_version_check = None  # timestamp of last cache_version DB check
+    conn = None
+    blocked_cats = set()
+    last_version_check = None
 
-    #  Connect to database on startup 
+    # Connect on startup
     try:
         conn = get_db_connection()
         blocked_cats = get_blocked_categories(conn)
         _known_cache_version = get_cache_version(conn)
         last_version_check = datetime.now()
-        log.info(f"Connected to DB. Blocked categories: {blocked_cats}")
+        log.info(f"Connected to DB. Blocked: {blocked_cats}")
+        log.info(f"Web classifier available: {CLASSIFIER_AVAILABLE}")
     except Exception as e:
-        # DB unavailable — log the error and continue.
-        # We will allow all traffic until DB is reachable (fail-open).
-        log.error(f"DB connection failed: {e}. Defaulting to ALLOW for all.")
+        log.error(f"DB connection failed: {e}")
 
-    #  Process one domain per line forever 
     for raw_line in sys.stdin:
         line = raw_line.strip()
         if not line:
-            continue   # skip empty lines
+            continue
 
-        #  Clean the domain 
-        # Squid sends things like "facebook.com:443" for HTTPS requests.
-        # We need to strip the port number and lowercase everything.
-        #
-        # .split()[0]   → take only the first word (handles extra whitespace)
-        # .split(':')[0] → take only the part before the colon (strips port)
-        # .strip()       → remove any remaining whitespace
+        # Clean domain — strip port and whitespace
         domain = line.lower().split()[0].split(':')[0].strip()
 
-        #  Periodic cache version check 
-        # Every 30 seconds, query the DB to see if a category was toggled in the UI.
-        # If the version number changed, clear _cache and reload blocked categories.
-        # This is how category changes propagate to Squid within 30 seconds.
+        # ── Periodic cache version check ──────────────────────
+        # If a toggle was flipped in the UI, clear cache and reload rules
         if conn and last_version_check:
-            seconds_since_check = (datetime.now() - last_version_check).total_seconds()
-
-            if seconds_since_check > 30:
+            elapsed = (datetime.now() - last_version_check).total_seconds()
+            if elapsed > 30:
                 try:
                     current_version = get_cache_version(conn)
-
                     if current_version != _known_cache_version:
-                        # Version changed — a toggle was flipped in the UI
                         log.info(
                             f"Cache version changed "
                             f"({_known_cache_version} → {current_version}). "
-                            f"Clearing cache and reloading blocked categories."
+                            f"Clearing cache."
                         )
-                        # Wipe entire cache so all domains are re-evaluated
                         _cache = {}
-                        # Reload which categories are now blocked
                         blocked_cats = get_blocked_categories(conn)
                         _known_cache_version = current_version
-
                     last_version_check = datetime.now()
-
                 except Exception as e:
-                    log.warning(f"Could not check cache version: {e}")
+                    log.warning(f"Cache version check failed: {e}")
 
-        #  Check in-memory cache 
-        # If we have already looked up this domain, return the cached result.
-        # This avoids a DB round trip for frequently visited domains.
+        # ── Return cached result if available ─────────────────
         if domain in _cache:
-            print(_cache[domain], flush=True)   # flush=True ensures Squid gets it immediately
+            print(_cache[domain], flush=True)
             continue
 
-        #  Fail open if DB is unavailable 
-        # If we cannot reach the database, allow all traffic rather than
-        # blocking everything. "Fail open" is safer for a proxy —
-        # blocking all traffic would completely break internet access.
+        # ── Fail open if DB is down ────────────────────────────
         if not conn:
             print('ERR', flush=True)
             continue
 
-        #  Normal lookup flow 
+        # ── Normal lookup ──────────────────────────────────────
         try:
-            # Reconnect if the connection dropped (DB restart, timeout, etc.)
             if conn.closed:
                 conn = get_db_connection()
 
-            # Query the DB for this domain's category
             action, category = lookup_domain(conn, domain, blocked_cats)
 
-            # If not in our DB, record it for the uncategorized review page
             if category == 'uncategorized':
+                # Log it to uncategorized_urls table for the UI
                 log_uncategorized(conn, domain)
 
-            # Write to request_log for the dashboard
-            log_request(conn, domain, category, action)
+                # ── NEW: Launch background classification ──────
+                # Only if the classifier is available and we are not
+                # already classifying this domain
+                if CLASSIFIER_AVAILABLE and domain not in _classifying_in_progress:
+                    thread = threading.Thread(
+                        target=classify_in_background,
+                        args=(domain, blocked_cats),
+                        daemon=True   # thread dies if main process dies
+                    )
+                    thread.start()
+                    log.info(f"Background classification started for: {domain}")
 
-            # Write to the categorizer log file for debugging
+            log_request(conn, domain, category, action)
             log.info(f"{domain} → {category} → {action}")
 
-            # Translate action to Squid's OK/ERR protocol
             response = squid_response(action)
 
-            # Cache the result (but cap cache size to avoid memory exhaustion)
             if len(_cache) < CACHE_MAX:
                 _cache[domain] = response
 
-            # Send the response to Squid — this MUST be the only output to stdout
             print(response, flush=True)
 
         except Exception as e:
             log.error(f"Error processing {domain}: {e}")
-            # Try to reconnect for the next request
             try:
                 conn = get_db_connection()
             except Exception:
                 conn = None
-            # Fail open — allow this request rather than breaking browsing
             print('ERR', flush=True)
 
 
-#  Entry Point 
-# This block only runs when you execute the file directly.
-# It does NOT run when the file is imported as a module.
 if __name__ == '__main__':
     main()
